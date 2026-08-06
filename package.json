@@ -1,7 +1,8 @@
 {
   "name": "ry-skill",
-  "version": "0.1.0",
-  "description": "Custom Pi skills for fast Herdr workflows.",
+  "version": "0.3.0",
+  "description": "Custom Pi skills and extensions for fast Herdr workflows.",
+  "type": "module",
   "license": "MIT",
   "author": "mithyer",
   "keywords": [
@@ -19,16 +20,32 @@
     "url": "https://github.com/mithyer/ry-skill/issues"
   },
   "files": [
-    "ry-herdr-fork",
+    "shared/herdr-session-launch.ts",
+    "shared/pi-session.ts",
+    "ry-herdr-clone/index.ts",
+    "ry-herdr-clone/SKILL.md",
+    "ry-herdr-fork/index.ts",
+    "ry-herdr-fork/SKILL.md",
     "README.md",
     "LICENSE"
   ],
+  "scripts": {
+    "test": "node --test ry-herdr-fork/index.test.ts ry-herdr-clone/index.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "publishConfig": {
     "access": "public"
   },
   "pi": {
+    "extensions": [
+      "./ry-herdr-fork/index.ts",
+      "./ry-herdr-clone/index.ts"
+    ],
     "skills": [
-      "./ry-herdr-fork"
+      "./ry-herdr-fork",
+      "./ry-herdr-clone"
     ]
   }
 }
