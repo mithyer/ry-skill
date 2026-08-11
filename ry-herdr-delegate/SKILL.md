@@ -10,7 +10,7 @@ Use this skill when a task should run in a separate, visible Herdr agent pane an
 
 ## Required Tool Boundary
 
-Call exactly `herdr_delegate` from `@andrewjacop/pi-herdr` for every delegation stage. A normal stage invocation has one stage; pipeline mode calls the same tool once per planned stage, sequentially. The same Andrew package's `herdr_wait_agent`, `herdr_read_agent`, and `herdr_close_pane` are continuation helpers only after `herdr_delegate` returns a live question or blocked pane; they must not replace the initial delegation call.
+Call exactly `herdr_delegate` from `@andrewjacop/pi-herdr` for every delegation stage. A normal stage invocation has one stage; pipeline mode calls the same tool once per planned stage, sequentially. The same Andrew package's `herdr_wait_agent`, `herdr_read_agent`, `herdr_send_prompt`, and `herdr_close_pane` are continuation helpers only after `herdr_delegate` returns a live question or non-terminal pane; they must not replace the initial delegation call.
 
 Do not substitute any of these for the delegation call:
 
@@ -40,11 +40,17 @@ If a task explicitly combines multiple dependent activities, such as implementat
 
 ## Interactive Wait And Completion
 
-`herdr_delegate` is a transport-level one-shot, not a semantic completion oracle. Andrew's `agent prompt --wait` can return when the child reaches `blocked`, including a permission dialog or an agent question, and `herdr_delegate` can report that call as successful. A settled pane, successful tool return, captured text, or permission/question prompt is therefore not completion.
+`herdr_delegate` and `herdr_wait_agent` report transport lifecycle, not semantic completion. Andrew's `agent prompt --wait` can return when the child reaches `blocked`, including a permission dialog or an agent question, and heterogeneous agents such as Claude or Codex may finish a turn as `idle` instead of `done`. A settled pane, successful tool return, `idle`, `done`, captured text, or permission/question prompt is therefore not sufficient by itself.
 
-For every stage, preserve the pane while validating the response: invoke `herdr_delegate` with `closeOnSuccess: false` even when the effective close policy is true. If the response is a live permission request or interactive question, do not answer by guessing and do not start the next stage. Use the same Andrew package's `herdr_wait_agent` to wait for the pane to leave the prompt (`working`, then `idle` or `done`) after the user or an authorized parent answers it, and use `herdr_read_agent` to capture the final response. Repeat this continuation wait within the remaining stage timeout. A child that has already returned a terminal `STATUS: BLOCKED` because it needs a decision should be surfaced to the parent instead of being spun on indefinitely.
+For every stage, preserve the pane while validating the response: invoke `herdr_delegate` with `closeOnSuccess: false` even when the effective close policy is true. Run this continuation loop with the remaining stage timeout and at most three automatic follow-ups:
 
-After a valid `DONE` with required headings and validation evidence, close the pane with Andrew's `herdr_close_pane` only when the effective `closeOnSuccess` is true. On timeout, malformed output, unresolved permission, or unanswered question, keep the pane open and return `BLOCKED` or `PARTIAL` with its pane id and recovery information. The built-in Codex and Claude autonomy flags should prevent ordinary permission prompts, but this wait rule remains mandatory when a prompt still appears or an agent asks for clarification.
+1. Use `herdr_wait_agent` to observe the pane's current or next lifecycle state (`working`, `blocked`, `idle`, or `done`). This observation never completes the stage by itself.
+2. Use `herdr_read_agent` to capture recent unwrapped context. Only a complete child contract with `STATUS: DONE`, all required headings, and validation evidence is semantic completion. A lifecycle `done` without that contract is incomplete; an `idle` state with that contract is a settled response for agents that do not emit `done`.
+3. If the pane is `working`, wait for another state transition before sending a follow-up. If it is `blocked`, `idle`, or `done` without a valid DONE, classify the context. For a routine permission/question prompt that the original task and autonomy policy already answer, send a concise continuation with `herdr_send_prompt` to the same pane: tell the child to continue the current task, resolve routine prompts without stopping, preserve constraints, and end with the complete status contract. Do not start another agent or another pipeline stage.
+4. If the context requires a user decision, a credential, an unsafe scope expansion, or an answer the parent cannot infer, stop the loop and return `BLOCKED` with the exact question, context, pane id, and recovery information. Do not guess or blindly approve a permission dialog.
+5. After sending a continuation, return to step 1. On timeout or after three unresolved follow-ups, keep the pane open and return `PARTIAL` or `BLOCKED` rather than claiming completion.
+
+After a valid `DONE` with required headings and validation evidence, close the pane with Andrew's `herdr_close_pane` only when the effective `closeOnSuccess` is true. The built-in Codex and Claude autonomy flags should prevent ordinary permission prompts, but this loop remains mandatory when a prompt still appears or an agent asks for clarification.
 
 ## Role Contracts
 
@@ -220,8 +226,8 @@ Do not run multiple workers against the same working tree concurrently. Read-onl
 
 - For a non-pipeline role, treat one valid `DONE` result as completion.
 - For pipeline mode, every planned stage must return a valid `DONE`; a reviewer `DONE` with findings is still a completed stage because findings are handed to any explicitly planned later stage and are not an automatic repair loop. Preserve the plan, every stage's status, changed files, validation, review findings, recovery command/semantics, and blockers.
-- Treat a missing or malformed status line, a timeout, a tool error, or output that only shows pane startup as incomplete. A successful `herdr_delegate` call or a settled pane is not semantic completion.
+- Treat a missing or malformed status line, a timeout, a tool error, output that only shows pane startup, or any non-terminal lifecycle state without a valid contract as incomplete. A successful `herdr_delegate` call or a settled pane is not semantic completion.
 - Treat `BLOCKED` and `PARTIAL` as incomplete and surface the blocker or missing work. Claim completion only for a valid `DONE` response with all required headings and validation evidence.
 - For `worker` or an explicitly authorized reviewer that edited files, inspect the resulting diff and run the parent-level validation before claiming completion.
 - With the effective `closeOnSuccess: true`, preserve and print every child's recovery command after the response, but apply closure only after a valid `DONE` by calling Andrew's `herdr_close_pane`. Leave the pane open for `BLOCKED`, `PARTIAL`, timeout, malformed output, or an unresolved interactive prompt. Pane retention does not replace response validation.
-- Do not report a task as complete solely because a pane started; completion requires a settled delegate result and appropriate validation.
+- Do not report a task as complete solely because a pane started or reached `idle`/`blocked`/`done`; completion requires the continuation loop to obtain a valid semantic `DONE` result and appropriate validation.
