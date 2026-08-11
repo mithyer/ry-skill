@@ -92,6 +92,8 @@ The default role mapping is:
 | `oracle` | `pi` |
 | `delegate` | `pi` |
 
+The default Codex profile passes `--dangerously-bypass-approvals-and-sandbox`, the current Codex CLI equivalent of `--yolo`; the default Claude profile passes `--dangerously-skip-permissions`. These flags enable autonomous execution by disabling normal approval, sandbox, or permission checks. Set the corresponding profile's `extraArgs` to `[]` in the global configuration to opt out. A permission prompt or agent question is not treated as completion: the skill keeps the Andrew Herdr pane open, waits for continuation, and only closes it after a valid `DONE`.
+
 Use [`ry-herdr-delegate/config.example.json`](ry-herdr-delegate/config.example.json) as the template for the optional global configuration at `~/.pi/agent/ry-herdr-delegate.json`; the skill does not create or overwrite that global file.
 
 Use `/skill:ry-herdr-delegate` and describe the task, or include an explicit stage role such as `worker` or `reviewer`. Use `/skill:ry-herdr-delegate pipeline` to force pipeline mode. A request such as `写代码+review` automatically enters pipeline mode. The planner can produce sequences such as `scout -> worker -> reviewer` or `researcher -> oracle -> worker -> reviewer`; `pipeline` is never passed to a child agent. The pipeline stops when a stage does not return a valid `DONE`, and reviewer stages only report findings unless a later worker stage is explicitly planned.

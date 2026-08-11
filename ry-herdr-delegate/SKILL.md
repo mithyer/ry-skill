@@ -10,7 +10,7 @@ Use this skill when a task should run in a separate, visible Herdr agent pane an
 
 ## Required Tool Boundary
 
-Call exactly `herdr_delegate` from `@andrewjacop/pi-herdr` for every delegation stage. A normal stage invocation has one stage; pipeline mode calls the same tool once per planned stage, sequentially.
+Call exactly `herdr_delegate` from `@andrewjacop/pi-herdr` for every delegation stage. A normal stage invocation has one stage; pipeline mode calls the same tool once per planned stage, sequentially. The same Andrew package's `herdr_wait_agent`, `herdr_read_agent`, and `herdr_close_pane` are continuation helpers only after `herdr_delegate` returns a live question or blocked pane; they must not replace the initial delegation call.
 
 Do not substitute any of these for the delegation call:
 
@@ -37,6 +37,14 @@ Use an explicit stage role supplied after `/skill:ry-herdr-delegate` or in the t
 | A self-contained request without a more specific role | `delegate` |
 
 If a task explicitly combines multiple dependent activities, such as implementation plus review or research plus implementation, enter `pipeline` mode; this includes requests such as `写代码+review`. An explicit `pipeline` mode directive after `/skill:ry-herdr-delegate` forces pipeline mode, while an explicit stage role supplied there wins over automatic mode selection. `pipeline` is a mode directive, never a stage role or profile. Select `worker` for implementation alone and `reviewer` for review alone. If a task could equally be read as read-only analysis or implementation, ask which stage role is intended. Do not turn an ambiguous request into file edits.
+
+## Interactive Wait And Completion
+
+`herdr_delegate` is a transport-level one-shot, not a semantic completion oracle. Andrew's `agent prompt --wait` can return when the child reaches `blocked`, including a permission dialog or an agent question, and `herdr_delegate` can report that call as successful. A settled pane, successful tool return, captured text, or permission/question prompt is therefore not completion.
+
+For every stage, preserve the pane while validating the response: invoke `herdr_delegate` with `closeOnSuccess: false` even when the effective close policy is true. If the response is a live permission request or interactive question, do not answer by guessing and do not start the next stage. Use the same Andrew package's `herdr_wait_agent` to wait for the pane to leave the prompt (`working`, then `idle` or `done`) after the user or an authorized parent answers it, and use `herdr_read_agent` to capture the final response. Repeat this continuation wait within the remaining stage timeout. A child that has already returned a terminal `STATUS: BLOCKED` because it needs a decision should be surfaced to the parent instead of being spun on indefinitely.
+
+After a valid `DONE` with required headings and validation evidence, close the pane with Andrew's `herdr_close_pane` only when the effective `closeOnSuccess` is true. On timeout, malformed output, unresolved permission, or unanswered question, keep the pane open and return `BLOCKED` or `PARTIAL` with its pane id and recovery information. The built-in Codex and Claude autonomy flags should prevent ordinary permission prompts, but this wait rule remains mandatory when a prompt still appears or an agent asks for clarification.
 
 ## Role Contracts
 
@@ -86,7 +94,7 @@ The configuration shape is:
       "effort": "high",
       "modelArgs": ["--model", "{model}"],
       "effortArgs": ["-c", "model_reasoning_effort=\"{effort}\""],
-      "extraArgs": [],
+      "extraArgs": ["--dangerously-bypass-approvals-and-sandbox"],
       "recoveryArgs": ["resume", "--last"],
       "env": {}
     }
@@ -108,6 +116,8 @@ The configuration shape is:
   }
 }
 ```
+
+The built-in Codex profile passes `--dangerously-bypass-approvals-and-sandbox`, the current Codex CLI equivalent of the requested `--yolo` behavior. The built-in Claude profile passes `--dangerously-skip-permissions`. These flags disable normal approval, sandbox, or permission checks; set the selected profile's `extraArgs` to an empty array to opt out.
 
 Validate the configuration before delegating:
 
@@ -141,7 +151,7 @@ Built-in role-to-profile defaults are used for omitted role entries; an explicit
 | `oracle` | `pi` |
 | `delegate` | `pi` |
 
-When a profile or role field is absent, built-in profile defaults use `closeOnSuccess: true` and these recovery arguments: Codex uses `resume --last`, Claude uses `--continue`, and Pi uses `--continue`. These recover the most recent saved session in the current directory when the CLI supports it; they are not guarantees of exact session identity. When no `pipelines.default.maxStages` is configured, the built-in pipeline limit is `8`; it does not define a role sequence.
+When a profile or role field is absent, built-in profile defaults use `closeOnSuccess: true`, Codex's `--dangerously-bypass-approvals-and-sandbox`, Claude's `--dangerously-skip-permissions`, and these recovery arguments: Codex uses `resume --last`, Claude uses `--continue`, and Pi uses `--continue`. These recover the most recent saved session in the current directory when the CLI supports it; they are not guarantees of exact session identity. The autonomy flags disable normal approval, sandbox, or permission checks and can be removed with a profile `extraArgs: []` override. When no `pipelines.default.maxStages` is configured, the built-in pipeline limit is `8`; it does not define a role sequence.
 
 ## Build The Child Prompt
 
@@ -199,10 +209,10 @@ For a non-pipeline role, resolve one profile and make one `herdr_delegate` call 
 - `prompt`: the complete child prompt;
 - `cwd`: the current project directory, unless the user explicitly names another checkout;
 - `timeoutMs`: the role override, profile/default timeout, or `180000`;
-- `closeOnSuccess`: the role/default value, or `true`;
+- `closeOnSuccess`: always pass `false` to the initial `herdr_delegate` call so semantic validation and interactive continuation can finish before pane closure; retain the effective role/default value as the post-validation close policy;
 - `env`: the resolved environment map, when non-empty.
 
-For pipeline mode, first build the ordered plan above, then resolve each stage's existing role/profile configuration and make the same `herdr_delegate` call once per stage, waiting for each result before starting the next. Use the same `cwd` for every stage and pass the plan, stage objective, and previous stage's concise result into the next prompt. Do not run stages concurrently. Start each next stage only after the previous stage returns a valid `DONE`; otherwise stop and preserve the incomplete result and recovery command. A later `worker` may act on a prior `reviewer` result only when that stage is explicitly present in the plan.
+For pipeline mode, first build the ordered plan above, then resolve each stage's existing role/profile configuration and make the same `herdr_delegate` call once per stage, including the continuation wait when the stage is blocked or interactive, before starting the next. Use the same `cwd` for every stage and pass the plan, stage objective, and previous stage's concise result into the next prompt. Do not run stages concurrently. Start each next stage only after the previous stage returns a valid `DONE`; otherwise stop and preserve the incomplete result and recovery command. A later `worker` may act on a prior `reviewer` result only when that stage is explicitly present in the plan.
 
 Do not run multiple workers against the same working tree concurrently. Read-only scouts, researchers, and oracles may be parallelized only when the user requests it and each prompt is independent. `herdr_delegate` has no automatic worktree isolation; use an explicitly prepared checkout when isolated edits are required.
 
@@ -213,5 +223,5 @@ Do not run multiple workers against the same working tree concurrently. Read-onl
 - Treat a missing or malformed status line, a timeout, a tool error, or output that only shows pane startup as incomplete. A successful `herdr_delegate` call or a settled pane is not semantic completion.
 - Treat `BLOCKED` and `PARTIAL` as incomplete and surface the blocker or missing work. Claim completion only for a valid `DONE` response with all required headings and validation evidence.
 - For `worker` or an explicitly authorized reviewer that edited files, inspect the resulting diff and run the parent-level validation before claiming completion.
-- With the default `closeOnSuccess: true`, preserve and print every child's recovery command after the response. Set `closeOnSuccess` to false only when the parent needs to inspect a pane after that stage; pane retention does not replace response validation.
+- With the effective `closeOnSuccess: true`, preserve and print every child's recovery command after the response, but apply closure only after a valid `DONE` by calling Andrew's `herdr_close_pane`. Leave the pane open for `BLOCKED`, `PARTIAL`, timeout, malformed output, or an unresolved interactive prompt. Pane retention does not replace response validation.
 - Do not report a task as complete solely because a pane started; completion requires a settled delegate result and appropriate validation.

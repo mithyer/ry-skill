@@ -12,7 +12,7 @@
       "effort": "high",
       "modelArgs": ["--model", "{model}"],
       "effortArgs": ["-c", "model_reasoning_effort=\"{effort}\""],
-      "extraArgs": [],
+      "extraArgs": ["--dangerously-bypass-approvals-and-sandbox"],
       "recoveryArgs": ["resume", "--last"],
       "env": {}
     },
@@ -22,7 +22,7 @@
       "effort": "high",
       "modelArgs": ["--model", "{model}"],
       "effortArgs": ["--effort", "{effort}"],
-      "extraArgs": [],
+      "extraArgs": ["--dangerously-skip-permissions"],
       "recoveryArgs": ["--continue"],
       "env": {}
     },
