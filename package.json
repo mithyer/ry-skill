@@ -1,6 +1,6 @@
 {
   "name": "ry-skill",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Custom Pi skills and extensions for fast Herdr workflows.",
   "type": "module",
   "license": "MIT",
@@ -26,6 +26,8 @@
     "ry-herdr-clone/SKILL.md",
     "ry-herdr-fork/index.ts",
     "ry-herdr-fork/SKILL.md",
+    "ry-herdr-delegate/SKILL.md",
+    "ry-herdr-delegate/config.example.json",
     "README.md",
     "LICENSE"
   ],
@@ -33,6 +35,9 @@
     "test": "node --test ry-herdr-fork/index.test.ts ry-herdr-clone/index.test.ts"
   },
   "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
   "publishConfig": {
@@ -45,7 +50,8 @@
     ],
     "skills": [
       "./ry-herdr-fork",
-      "./ry-herdr-clone"
+      "./ry-herdr-clone",
+      "./ry-herdr-delegate"
     ]
   }
 }

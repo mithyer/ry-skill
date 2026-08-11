@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "defaults": {
+    "timeoutMs": 180000,
+    "closeOnSuccess": true,
+    "env": {}
+  },
+  "agents": {
+    "codex": {
+      "kind": "codex",
+      "model": null,
+      "effort": "high",
+      "modelArgs": ["--model", "{model}"],
+      "effortArgs": ["-c", "model_reasoning_effort=\"{effort}\""],
+      "extraArgs": [],
+      "recoveryArgs": ["resume", "--last"],
+      "env": {}
+    },
+    "claude": {
+      "kind": "claude",
+      "model": null,
+      "effort": "high",
+      "modelArgs": ["--model", "{model}"],
+      "effortArgs": ["--effort", "{effort}"],
+      "extraArgs": [],
+      "recoveryArgs": ["--continue"],
+      "env": {}
+    },
+    "pi": {
+      "kind": "pi",
+      "model": null,
+      "effort": "high",
+      "modelArgs": ["--model", "{model}"],
+      "effortArgs": ["--thinking", "{effort}"],
+      "extraArgs": [],
+      "recoveryArgs": ["--continue"],
+      "env": {}
+    }
+  },
+  "roles": {
+    "scout": {
+      "agent": "codex",
+      "effort": "low"
+    },
+    "researcher": {
+      "agent": "claude"
+    },
+    "worker": {
+      "agent": "codex",
+      "effort": "high",
+      "timeoutMs": 300000,
+      "env": {}
+    },
+    "reviewer": {
+      "agent": "claude",
+      "timeoutMs": 240000
+    },
+    "oracle": {
+      "agent": "pi",
+      "effort": "medium"
+    },
+    "delegate": {
+      "agent": "pi",
+      "effort": "medium"
+    }
+  },
+  "pipelines": {
+    "default": {
+      "maxStages": 8
+    }
+  }
+}
