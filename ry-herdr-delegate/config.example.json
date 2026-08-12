@@ -2,7 +2,7 @@
   "version": 1,
   "defaults": {
     "timeoutMs": 180000,
-    "closeOnSuccess": true,
+    "panePolicy": "new-tab",
     "env": {}
   },
   "agents": {
@@ -12,7 +12,7 @@
       "effort": "high",
       "modelArgs": ["--model", "{model}"],
       "effortArgs": ["-c", "model_reasoning_effort=\"{effort}\""],
-      "extraArgs": ["--dangerously-bypass-approvals-and-sandbox"],
+      "extraArgs": ["--yolo"],
       "recoveryArgs": ["resume", "--last"],
       "env": {}
     },
@@ -49,6 +49,7 @@
       "agent": "codex",
       "effort": "high",
       "timeoutMs": 300000,
+      "panePolicy": "new-tab",
       "env": {}
     },
     "reviewer": {
