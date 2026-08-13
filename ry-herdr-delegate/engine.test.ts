@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -25,6 +25,8 @@ import type {
 interface FakeGatewayOptions {
 	/** Agent target that should be reported as definitively closed. */
 	closedTarget?: string;
+	/** Exact session returned consistently by the simulated child lifecycle. */
+	session?: SessionIdentity;
 	/** Session identity returned by resumed agent startup. */
 	startedSession?: SessionIdentity;
 	/** Terminal snapshots returned sequentially to simulate Herdr's delayed TUI refresh. */
@@ -62,7 +64,7 @@ class FakeGateway implements HerdrGateway {
 			workspaceId: "w-test",
 			tabId: "w-test:t1",
 			cwd: "/tmp/project",
-			agentSession: sessionExact ? { kind: "id", source: "fake", value: "session-test" } : undefined,
+			agentSession: sessionExact ? options.session ?? { kind: "id", source: "fake", value: "session-test" } : undefined,
 		};
 	}
 
@@ -95,6 +97,11 @@ class FakeGateway implements HerdrGateway {
 	async movePane(_input: MovePaneInput): Promise<{ tabId?: string }> { this.calls.push("move"); return { tabId: "w-test:t2" }; }
 	async closePane(_paneId: string): Promise<void> { this.calls.push("close"); }
 	async snapshot(): Promise<HerdrSnapshot> { this.calls.push("snapshot"); return { raw: {}, agents: [this.childSnapshot] }; }
+}
+
+/** Builds one minimally complete Pi session message for exact-session output-capture tests. */
+function piSessionMessage(role: "assistant" | "user", text: string): string {
+	return JSON.stringify({ type: "message", message: { role, content: [{ type: "text", text }] } });
 }
 
 /** Creates a deterministic engine with an isolated JSONL communication directory. */
@@ -156,6 +163,43 @@ test("DelegateEngine rereads a stale terminal snapshot before parsing the comple
 		assert.equal(result.status, "DONE");
 		assert.equal(gateway.calls.filter((call) => call === "read").length, 2);
 		assert.deepEqual(delays, [250]);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("DelegateEngine falls back to the exact Pi session when Herdr terminal rows wrap", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-session-fallback-"));
+	try {
+		const sessionFile = join(root, "child.jsonl");
+		const communicationFile = join(root, "communications", "worker-session-fallback.jsonl");
+		const currentRelay = [
+			`COMMUNICATION FILE: ${communicationFile}`,
+			"MESSAGE ID: msg-session-fallback",
+		].join("\n");
+		await writeFile(sessionFile, [
+			piSessionMessage("user", "COMMUNICATION FILE: /tmp/old.jsonl\nMESSAGE ID: msg-old"),
+			piSessionMessage("assistant", "STATUS: DONE\nSUMMARY: stale result\nVALIDATION: stale validation"),
+			piSessionMessage("user", currentRelay),
+			piSessionMessage("assistant", "STATUS: DONE\nSUMMARY: session fallback completed\nVALIDATION: exact Pi session read"),
+		].join("\n").concat("\n"));
+		const session: SessionIdentity = { kind: "path", source: "herdr:pi", value: sessionFile };
+		const gateway = new FakeGateway("S\nT\nA\nT\nU\nS\n:\nD\nO\nN\nE", "done", true, { session });
+		const engine = new DelegateEngine({
+			gateway,
+			config: parseDelegateConfig({ version: 1 }),
+			communicationDirectory: join(root, "communications"),
+			id: () => "session-fallback",
+			sleep: async () => { throw new Error("wrapped terminal capture should use the exact session before retrying"); },
+		});
+		const result = await engine.run({ action: "delegate", task: "capture wrapped output", role: "worker" }, {
+			cwd: "/tmp/project",
+			workspaceId: "w-test",
+			sourcePaneId: "w-test:p1",
+		});
+		assert.equal(result.status, "DONE");
+		assert.equal(result.completion?.summary, "session fallback completed");
+		assert.equal(gateway.calls.filter((call) => call === "read").length, 1);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

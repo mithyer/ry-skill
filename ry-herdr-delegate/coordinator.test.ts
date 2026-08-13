@@ -4,7 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { parseDelegateConfig } from "./config.ts";
-import { PipelineCoordinator } from "./pipeline-coordinator.ts";
+import { COORDINATOR_BOOTSTRAP, PipelineCoordinator } from "./pipeline-coordinator.ts";
 import { PipelineStore } from "./pipeline.ts";
 import type {
 	CreateTabInput,
@@ -78,6 +78,14 @@ class CoordinatorFakeGateway implements HerdrGateway {
 	async closePane(_paneId: string): Promise<void> { this.calls.push("close"); }
 	async snapshot(): Promise<HerdrSnapshot> { this.calls.push("snapshot"); return { raw: {}, agents: [this.agent] }; }
 }
+
+/** Ensures a coordinator child uses the structured scheduling boundary instead of mutating JSONL directly. */
+test("COORDINATOR_BOOTSTRAP delegates durable writes to the structured tool", () => {
+	assert.match(COORDINATOR_BOOTSTRAP, /ry_herdr_delegate_tool exactly once with action pipeline\.coordinator/);
+	assert.match(COORDINATOR_BOOTSTRAP, /Do not directly read, write, append, edit, or repair pipeline JSONL/);
+	assert.doesNotMatch(COORDINATOR_BOOTSTRAP, /append the event to the authoritative JSONL log/);
+	assert.doesNotMatch(COORDINATOR_BOOTSTRAP, /Use only the leaf delegate action/);
+});
 
 /** Creates a coordinator manager with deterministic IDs and isolated state. */
 async function makeCoordinator(root: string, gateway: HerdrGateway): Promise<{ coordinator: PipelineCoordinator; store: PipelineStore }> {

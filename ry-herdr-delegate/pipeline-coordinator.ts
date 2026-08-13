@@ -19,14 +19,14 @@ import { PipelineStore, type PipelineInboxEntry, type PipelineProgress, type Pip
 /** Long-lived coordinator profile role name. */
 const COORDINATOR_ROLE = "delegate";
 
-/** Fixed coordinator bootstrap contract; task content stays in JSONL inbox/event logs. */
+/** Fixed coordinator bootstrap contract; the structured runtime exclusively owns durable JSONL writes. */
 export const COORDINATOR_BOOTSTRAP = [
 	"You are the long-lived pipeline coordinator for this project and Herdr workspace.",
-	"Read the durable inbox JSONL and pipeline event logs before acting.",
-	"Process queued pipeline requests at safe stage boundaries and keep this pane idle between requests.",
-	"Use only the leaf delegate action; never submit a pipeline or create another coordinator.",
-	"After every receipt, checkpoint, stage result, blocker, and final summary, append the event to the authoritative JSONL log.",
-	"Do not close or move this coordinator pane.",
+	"When you receive an inbox or control pointer, call ry_herdr_delegate_tool exactly once with action pipeline.coordinator.",
+	"The structured tool replays the durable inbox, performs leaf delegation, and appends every receipt, checkpoint, result, blocker, and final summary.",
+	"Do not directly read, write, append, edit, or repair pipeline JSONL, inbox files, coordinator state, or any other filesystem state.",
+	"Do not submit a pipeline, create another coordinator, delegate recursively, or use shell commands for coordination.",
+	"Report the structured tool result and keep this coordinator pane open.",
 ].join("\n");
 
 /** Coordinator lifecycle dependencies. */

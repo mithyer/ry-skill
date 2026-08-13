@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
 
 import { buildFinalAgentArgs } from "./args.ts";
 import { resolveAgentProfile, type ConfigCapabilities } from "./config.ts";
@@ -72,6 +72,16 @@ interface CapturedCompletion {
 	completion: CompletionContract;
 	/** One-based terminal-output capture attempt count. */
 	attempts: number;
+	/** Durable source that supplied the parsed completion contract. */
+	source: "pi-session" | "terminal";
+}
+
+/** Minimal Pi session message retained while locating one exact relay response. */
+interface PiSessionMessage {
+	/** Pi conversation role represented by the serialized message. */
+	role: "assistant" | "user";
+	/** Joined text segments from the message content. */
+	text: string;
 }
 
 /** Creates a single-line structured event payload from arbitrary task context. */
@@ -123,6 +133,82 @@ function communicationPath(directory: string, role: string, id: string): string 
 /** Compares all fields of two exact agent-session identities. */
 function sameSession(left: SessionIdentity, right: SessionIdentity): boolean {
 	return left.kind === right.kind && left.source === right.source && left.value === right.value;
+}
+
+/** Checks whether an exact Herdr-reported session can be read as a local Pi JSONL file. */
+function isReadablePiSession(session: SessionIdentity | undefined): session is SessionIdentity {
+	return Boolean(
+		session
+		&& session.kind === "path"
+		&& session.source === "herdr:pi"
+		&& isAbsolute(session.value)
+		&& session.value.endsWith(".jsonl"),
+	);
+}
+
+/** Narrows an unknown JSON value into a plain record. */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+/** Extracts text-only Pi content so tool calls and reasoning never become completion evidence. */
+function piMessageText(content: unknown): string {
+	if (!Array.isArray(content)) return "";
+	const text: string[] = [];
+	for (const item of content) {
+		const segment = asRecord(item);
+		if (segment?.type === "text" && typeof segment.text === "string") text.push(segment.text);
+	}
+	return text.join("\n");
+}
+
+/** Decodes complete user and assistant text messages from an append-only Pi session file. */
+function parsePiSessionMessages(text: string): readonly PiSessionMessage[] {
+	const messages: PiSessionMessage[] = [];
+	for (const line of text.split("\n")) {
+		if (!line.trim()) continue;
+		try {
+			const entry = asRecord(JSON.parse(line));
+			const message = entry?.type === "message" ? asRecord(entry.message) : undefined;
+			const role = message?.role;
+			if (!message || (role !== "assistant" && role !== "user")) continue;
+			const messageText = piMessageText(message.content);
+			if (messageText) messages.push({ role, text: messageText });
+		} catch {
+			// A session may be mid-append; complete earlier entries remain safe to inspect.
+		}
+	}
+	return messages;
+}
+
+/** Matches the parent-generated relay markers so an older Pi turn cannot supply this completion. */
+function isMatchingPiRelay(text: string, communicationFile: string, messageId: string): boolean {
+	const lines = new Set(text.split(/\r?\n/).map((line) => line.trim()));
+	return lines.has(`COMMUNICATION FILE: ${communicationFile}`) && lines.has(`MESSAGE ID: ${messageId}`);
+}
+
+/** Finds a strict completion response associated with one exact relay in a Pi session. */
+function parsePiRelayCompletion(text: string, communicationFile: string, messageId: string): CompletionContract | undefined {
+	const messages = parsePiSessionMessages(text);
+	let relayIndex = -1;
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		if (messages[index].role === "user" && isMatchingPiRelay(messages[index].text, communicationFile, messageId)) {
+			relayIndex = index;
+			break;
+		}
+	}
+	if (relayIndex < 0) return undefined;
+	let assistantText: string | undefined;
+	for (let index = relayIndex + 1; index < messages.length; index += 1) {
+		if (messages[index].role === "user") break;
+		if (messages[index].role === "assistant") assistantText = messages[index].text;
+	}
+	if (!assistantText) return undefined;
+	try {
+		return parseCompletionContract(assistantText);
+	} catch {
+		return undefined;
+	}
 }
 
 /** Converts any gateway or parser failure into a semantic result without closing the pane. */
@@ -263,7 +349,7 @@ export class DelegateEngine {
 				}, "debug");
 				await this.relayAndAwaitTurn(existingAgent.agent, relay, profile.timeoutMs, signal);
 				await debug.log("leaf.relay.sent", { communicationId: runtime.communicationId, agent: existingAgent.agent, paneId: existingAgent.paneId, messageType, waitForTurn: true }, "debug");
-				return await this.waitAndResolve(runtime, profile.timeoutMs, owner, signal);
+				return await this.waitAndResolve(runtime, profile.timeoutMs, owner, messageId, signal);
 			}
 			await debug.log("leaf.pane.split.start", { communicationId: runtime.communicationId, sourcePaneId: context.sourcePaneId, cwd: runtime.cwd }, "debug");
 			const finalArgs = buildFinalAgentArgs(profile, request.previousSession);
@@ -332,7 +418,7 @@ export class DelegateEngine {
 			}, undefined, observedSession));
 			await this.relayAndAwaitTurn(started.agent, relay, profile.timeoutMs, signal);
 			await debug.log("leaf.relay.sent", { communicationId: runtime.communicationId, agent: started.agent, paneId: started.paneId, messageType, waitForTurn: true }, "debug");
-			return await this.waitAndResolve(runtime, profile.timeoutMs, owner, signal);
+			return await this.waitAndResolve(runtime, profile.timeoutMs, owner, messageId, signal);
 		} catch (error) {
 			await debug.log("leaf.run.failed", { communicationId: runtime.communicationId, transaction: runtime.transaction, stageRole: runtime.stageRole, error: debugError(error) }, "error");
 			await appendEvent(communicationFile, event("error", owner, runtime, { error: error instanceof Error ? error.message : String(error) })).catch(() => undefined);
@@ -359,12 +445,15 @@ export class DelegateEngine {
 
 	/**
 	 * Captures a child terminal snapshot until a completion contract is visible or the bounded refresh budget is exhausted.
+	 * An exact local Pi session is checked after each failed terminal parse to bypass visual row wrapping.
 	 *
 	 * @param runtime Current exact child-pane and session context.
-	 * @returns The first parsed completion contract, or the final parser failure with capture count.
+	 * @param relayMessageId Parent-generated identity for this exact child relay.
+	 * @returns The first parsed completion contract, or the final parser failure with capture metadata.
 	 * TEST:engine.test.ts[DelegateEngine rereads a stale terminal snapshot before parsing the completion contract]
+	 * TEST:engine.test.ts[DelegateEngine falls back to the exact Pi session when Herdr terminal rows wrap]
 	 */
-	private async captureCompletion(runtime: LeafRuntime): Promise<CapturedCompletion> {
+	private async captureCompletion(runtime: LeafRuntime, relayMessageId: string): Promise<CapturedCompletion> {
 		const sleep = this.dependencies.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
 		let completion: CompletionContract | undefined;
 		for (let attempt = 1; attempt <= MAX_OUTPUT_CAPTURE_ATTEMPTS; attempt += 1) {
@@ -378,7 +467,7 @@ export class DelegateEngine {
 					length: output.length,
 					sha256: hashDebugText(output),
 				}, "trace");
-				return { completion, attempts: attempt };
+				return { completion, attempts: attempt, source: "terminal" };
 			} catch (error) {
 				completion = errorCompletionContract(error);
 				await debug.log("leaf.output.contract-missing", {
@@ -389,10 +478,45 @@ export class DelegateEngine {
 					length: output.length,
 					sha256: hashDebugText(output),
 				}, attempt === MAX_OUTPUT_CAPTURE_ATTEMPTS ? "warn" : "trace");
+				const sessionCompletion = await this.capturePiSessionCompletion(runtime, relayMessageId);
+				if (sessionCompletion) return sessionCompletion;
 				if (attempt < MAX_OUTPUT_CAPTURE_ATTEMPTS) await sleep(OUTPUT_CAPTURE_RETRY_MS);
 			}
 		}
-		return { completion: completion!, attempts: MAX_OUTPUT_CAPTURE_ATTEMPTS };
+		return { completion: completion!, attempts: MAX_OUTPUT_CAPTURE_ATTEMPTS, source: "terminal" };
+	}
+
+	/**
+	 * Falls back to a local exact Pi session only after every terminal capture fails strict contract parsing.
+	 *
+	 * @param runtime Current exact child-pane and session context.
+	 * @param relayMessageId Parent-generated identity for this exact child relay.
+	 * @returns Parsed session completion for the current relay, otherwise undefined.
+	 * TEST:engine.test.ts[DelegateEngine falls back to the exact Pi session when Herdr terminal rows wrap]
+	 */
+	private async capturePiSessionCompletion(runtime: LeafRuntime, relayMessageId: string): Promise<CapturedCompletion | undefined> {
+		if (!isReadablePiSession(runtime.session)) return undefined;
+		try {
+			const output = await readFile(runtime.session.value, "utf8");
+			const completion = parsePiRelayCompletion(output, runtime.communicationFile, relayMessageId);
+			if (!completion) return undefined;
+			await debug.log("leaf.output.session-contract-found", {
+				communicationId: runtime.communicationId,
+				agent: runtime.agent,
+				session: runtime.session,
+				length: output.length,
+				sha256: hashDebugText(output),
+			}, "trace");
+			return { completion, attempts: 0, source: "pi-session" };
+		} catch (error) {
+			await debug.log("leaf.output.session-unavailable", {
+				communicationId: runtime.communicationId,
+				agent: runtime.agent,
+				session: runtime.session,
+				error: debugError(error),
+			}, "trace");
+			return undefined;
+		}
 	}
 
 	/** Reuses an open exact-session pane and blocks on unknown or mismatched transport state. */
@@ -422,7 +546,7 @@ export class DelegateEngine {
 	}
 
 	/** Waits for settled child states, checkpointing every return before semantic validation. */
-	private async waitAndResolve(runtime: LeafRuntime, timeoutMs: number, owner: "parent" | "coordinator", signal?: AbortSignal): Promise<DelegateResult> {
+	private async waitAndResolve(runtime: LeafRuntime, timeoutMs: number, owner: "parent" | "coordinator", relayMessageId: string, signal?: AbortSignal): Promise<DelegateResult> {
 		let continuations = 0;
 		while (true) {
 			if (signal?.aborted) {
@@ -489,11 +613,12 @@ export class DelegateEngine {
 			}
 			let captured: CapturedCompletion;
 			try {
-				captured = await this.captureCompletion(runtime);
+				captured = await this.captureCompletion(runtime, relayMessageId);
 				await debug.log("leaf.output.read", {
 					communicationId: runtime.communicationId,
 					agent: runtime.agent,
 					attempts: captured.attempts,
+					source: captured.source,
 					semanticStatus: captured.completion.status,
 				}, "trace");
 			} catch (error) {
