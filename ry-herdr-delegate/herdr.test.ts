@@ -128,7 +128,36 @@ test("HerdrCliGateway uses the validated spawn boundary", async () => {
 	assert.deepEqual(waitCall.args.slice(-6), ["--until", "idle", "--until", "done", "--timeout", "25"]);
 });
 
-/** Checks non-zero Herdr exits retain stderr and exit metadata as structured errors. */
+/** Checks a newly split shell retries only Herdr's explicit transient pane-busy startup result. */
+test("HerdrCliGateway retries transient agent_pane_busy startup", async () => {
+	const calls: SpawnCall[] = [];
+	const delays: number[] = [];
+	let startAttempts = 0;
+	const spawnProcess: SpawnProcess = (command, args, options) => {
+		calls.push({ command, args: [...args], options });
+		if (args[0] === "agent" && args[1] === "start") {
+			startAttempts += 1;
+			if (startAttempts === 1) {
+				return fakeChild(JSON.stringify({ error: { code: "agent_pane_busy", message: "agent target pane w-test:p2 is not an available shell" } }), 1);
+			}
+			return fakeChild(JSON.stringify({ result: { ok: true } }));
+		}
+		if (args[0] === "agent" && args[1] === "get") return fakeChild(agentResponse());
+		return fakeChild(JSON.stringify({ result: { ok: true } }));
+	};
+	const gateway = new HerdrCliGateway({
+		command: "herdr-test",
+		cwd: "/tmp/project",
+		spawnProcess,
+		sleep: async (milliseconds) => { delays.push(milliseconds); },
+	});
+	const started = await gateway.startAgent({ name: "worker-test", kind: "pi", paneId: "w-test:p2", agentArgs: ["--thinking", "low"] });
+	assert.equal(started.agent, "worker-test");
+	assert.equal(startAttempts, 2);
+	assert.deepEqual(delays, [100]);
+	assert.equal(calls.filter((call) => call.args[0] === "agent" && call.args[1] === "start").length, 2);
+});
+
 test("HerdrCliGateway reports command failures with captured evidence", async () => {
 	const spawnProcess: SpawnProcess = (_command, _args, _options) => fakeChild("", 7, "SIGTERM");
 	const gateway = new HerdrCliGateway({ cwd: "/tmp/project", spawnProcess });

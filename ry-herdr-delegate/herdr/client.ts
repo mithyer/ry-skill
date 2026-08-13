@@ -35,7 +35,15 @@ export interface HerdrCliGatewayOptions {
 	debugLogger?: DebugLogger;
 	/** Injectable process creator for unit tests. */
 	spawnProcess?: SpawnProcess;
+	/** Optional delay seam used while a newly split pane becomes an available shell. */
+	sleep?: (milliseconds: number) => Promise<void>;
 }
+
+/** Maximum attempts while Herdr asynchronously promotes a newly split pane into an available shell. */
+const AGENT_START_ATTEMPTS = 30;
+
+/** Delay between explicit `agent_pane_busy` startup retries. */
+const AGENT_START_RETRY_MS = 100;
 
 /** Structured error raised when Herdr cannot satisfy a CLI capability. */
 export class HerdrCapabilityError extends Error {
@@ -113,6 +121,26 @@ function requiredString(record: Record<string, unknown>, keys: readonly string[]
 		if (typeof value === "string" && value.length > 0) return value;
 	}
 	throw new HerdrCapabilityError(`Herdr response is missing ${description}`, keys);
+}
+
+/** Extracts Herdr's structured error code without matching arbitrary diagnostic text. */
+function herdrErrorCode(error: unknown): string | undefined {
+	if (!(error instanceof HerdrCommandError)) return undefined;
+	for (const candidate of [error.stderr, error.stdout]) {
+		try {
+			const outer = asRecord(JSON.parse(candidate));
+			const nested = asRecord(outer?.error);
+			if (typeof nested?.code === "string") return nested.code;
+		} catch {
+			// A malformed error payload is not eligible for retry.
+		}
+	}
+	return undefined;
+}
+
+/** Returns whether Herdr has not yet promoted a new split pane into an agent-startable shell. */
+function isTransientAgentPaneBusy(error: unknown): boolean {
+	return herdrErrorCode(error) === "agent_pane_busy";
 }
 
 /** Normalizes a raw Herdr agent session object. */
@@ -194,6 +222,8 @@ export class HerdrCliGateway implements HerdrGateway {
 	private readonly timeoutMs: number;
 	/** Injectable process creator. */
 	private readonly spawnProcess: SpawnProcess;
+	/** Delay implementation used only for bounded newly split-pane startup retries. */
+	private readonly sleep: (milliseconds: number) => Promise<void>;
 	/** Best-effort logger for every Herdr command boundary. */
 	private readonly debugLogger: DebugLogger;
 	/** Cached capability probe result, shared by all gateway operations. */
@@ -210,6 +240,7 @@ export class HerdrCliGateway implements HerdrGateway {
 		this.env = { ...process.env, ...(options.env ?? {}) };
 		this.timeoutMs = options.timeoutMs ?? 300000;
 		this.spawnProcess = options.spawnProcess ?? ((command, args, spawnOptions) => nodeSpawn(command, args, spawnOptions));
+		this.sleep = options.sleep ?? ((milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
 		this.debugLogger = options.debugLogger ?? debug;
 	}
 
@@ -385,8 +416,23 @@ export class HerdrCliGateway implements HerdrGateway {
 			throw new Error("Herdr startAgent requires a non-empty string agentArgs array");
 		}
 		const args = ["agent", "start", input.name, "--kind", input.kind, "--pane", input.paneId, "--", ...input.agentArgs];
-		await this.runJson(args);
-		return this.getAgent(input.name);
+		for (let attempt = 1; attempt <= AGENT_START_ATTEMPTS; attempt += 1) {
+			try {
+				await this.runJson(args);
+				return this.getAgent(input.name);
+			} catch (error) {
+				if (!isTransientAgentPaneBusy(error) || attempt === AGENT_START_ATTEMPTS) throw error;
+				await this.debugLogger.log("herdr.agent.start.retry", {
+					name: input.name,
+					paneId: input.paneId,
+					attempt,
+					maxAttempts: AGENT_START_ATTEMPTS,
+					retryMs: AGENT_START_RETRY_MS,
+				});
+				await this.sleep(AGENT_START_RETRY_MS);
+			}
+		}
+		throw new Error("Herdr agent startup retry loop ended unexpectedly");
 	}
 
 	/**
