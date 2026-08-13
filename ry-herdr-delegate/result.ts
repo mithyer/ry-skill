@@ -3,9 +3,9 @@ import type { CompletionContract, SemanticStatus } from "./types.ts";
 /** Required headings in the child completion contract. */
 const REQUIRED_HEADINGS = ["STATUS", "SUMMARY", "VALIDATION"] as const;
 
-/** Extracts a single heading value from a markdown-like completion response. */
+/** Extracts a single heading value from raw child terminal output, tolerating Herdr's line indentation. */
 function readHeading(text: string, heading: string): string | undefined {
-	const pattern = new RegExp(`^${heading}\\s*:\\s*(.+)$`, "im");
+	const pattern = new RegExp(`^[\\t ]*${heading}\\s*:\\s*(.+?)\\s*$`, "im");
 	return text.match(pattern)?.[1]?.trim();
 }
 

@@ -10,6 +10,10 @@ test("completion contract parsing distinguishes DONE from incomplete output", ()
 	assert.equal(done.status, "DONE");
 	assert.equal(isSemanticDone(done), true);
 	assert.equal(isSemanticDone(parseCompletionContract("STATUS: DONE\nSUMMARY: implemented\nVALIDATION: pending")), true);
+	const indented = parseCompletionContract("\n STATUS: DONE\n SUMMARY: rendered through Herdr text snapshot\n VALIDATION: no files changed\n");
+	assert.equal(indented.status, "DONE");
+	assert.equal(indented.summary, "rendered through Herdr text snapshot");
+	assert.equal(isSemanticDone(indented), true);
 	assert.equal(errorCompletionContract(new Error("bad")).status, "ERROR");
 	assert.throws(() => parseCompletionContract("STATUS: DONE\nSUMMARY: missing validation"), /VALIDATION/);
 });

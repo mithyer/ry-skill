@@ -1,6 +1,6 @@
 {
   "name": "ry-skill",
-  "version": "0.5.5",
+  "version": "0.5.6",
   "description": "Custom Pi skills and extensions for fast Herdr workflows.",
   "type": "module",
   "license": "MIT",
