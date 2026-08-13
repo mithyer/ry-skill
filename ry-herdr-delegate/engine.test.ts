@@ -27,6 +27,8 @@ interface FakeGatewayOptions {
 	closedTarget?: string;
 	/** Session identity returned by resumed agent startup. */
 	startedSession?: SessionIdentity;
+	/** Terminal snapshots returned sequentially to simulate Herdr's delayed TUI refresh. */
+	outputs?: readonly string[];
 }
 
 /** Deterministic fake gateway for leaf engine tests. */
@@ -35,6 +37,8 @@ class FakeGateway implements HerdrGateway {
 	lastPrompt?: PromptInput;
 	private readonly childSnapshot: HerdrAgentSnapshot;
 	private readonly output: string;
+	private readonly outputs?: readonly string[];
+	private outputIndex = 0;
 	private readonly closedTarget?: string;
 	private readonly startedSession?: SessionIdentity;
 
@@ -48,6 +52,7 @@ class FakeGateway implements HerdrGateway {
 	 */
 	constructor(output: string, status: HerdrAgentSnapshot["status"] = "idle", sessionExact = true, options: FakeGatewayOptions = {}) {
 		this.output = output;
+		this.outputs = options.outputs;
 		this.closedTarget = options.closedTarget;
 		this.startedSession = options.startedSession;
 		this.childSnapshot = {
@@ -81,7 +86,11 @@ class FakeGateway implements HerdrGateway {
 		}
 		return this.childSnapshot;
 	}
-	async readAgent(_target: string): Promise<HerdrAgentOutput> { this.calls.push("read"); return { text: this.output }; }
+	async readAgent(_target: string): Promise<HerdrAgentOutput> {
+		this.calls.push("read");
+		const output = this.outputs?.[Math.min(this.outputIndex++, this.outputs.length - 1)] ?? this.output;
+		return { text: output };
+	}
 	async createTab(_input: CreateTabInput): Promise<{ tabId: string; paneId?: string }> { this.calls.push("tab-create"); return { tabId: "w-test:t2" }; }
 	async movePane(_input: MovePaneInput): Promise<{ tabId?: string }> { this.calls.push("move"); return { tabId: "w-test:t2" }; }
 	async closePane(_paneId: string): Promise<void> { this.calls.push("close"); }
@@ -124,7 +133,34 @@ test("DelegateEngine completes a leaf only after exact checkpoint and DONE contr
 	}
 });
 
-/** Checks blocked transport remains unresolved and never applies pane disposition. */
+/** Checks delayed Herdr terminal refreshes are reread without creating or prompting a new child. */
+test("DelegateEngine rereads a stale terminal snapshot before parsing the completion contract", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-output-refresh-"));
+	try {
+		const gateway = new FakeGateway("STATUS: DONE\nSUMMARY: unused\nVALIDATION: unused", "done", true, {
+			outputs: ["child terminal has not refreshed", "STATUS: DONE\nSUMMARY: refreshed\nVALIDATION: captured"],
+		});
+		const delays: number[] = [];
+		const engine = new DelegateEngine({
+			gateway,
+			config: parseDelegateConfig({ version: 1 }),
+			communicationDirectory: join(root, "communications"),
+			id: () => "output-refresh",
+			sleep: async (milliseconds) => { delays.push(milliseconds); },
+		});
+		const result = await engine.run({ action: "delegate", task: "capture output", role: "worker" }, {
+			cwd: "/tmp/project",
+			workspaceId: "w-test",
+			sourcePaneId: "w-test:p1",
+		});
+		assert.equal(result.status, "DONE");
+		assert.equal(gateway.calls.filter((call) => call === "read").length, 2);
+		assert.deepEqual(delays, [250]);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test("DelegateEngine preserves a blocked child pane", async () => {
 	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-blocked-"));
 	try {

@@ -9,6 +9,7 @@ import { planPaneDisposition } from "./pane-policy.ts";
 import { appendEvent, communicationIdFromPath, createEventLog, createEventLogEvent, readEventLog } from "./records.ts";
 import { errorCompletionContract, isSemanticDone, parseCompletionContract } from "./result.ts";
 import type {
+	CompletionContract,
 	DelegateConfig,
 	DelegateContext,
 	DelegateRequest,
@@ -25,6 +26,12 @@ import type {
 /** Maximum number of automatic continuation attempts for an unfinished leaf. */
 const MAX_CONTINUATIONS = 3;
 
+/** Maximum terminal-output captures before reporting an incomplete child completion contract. */
+const MAX_OUTPUT_CAPTURE_ATTEMPTS = 5;
+
+/** Delay between terminal-output rereads while Herdr refreshes a child TUI snapshot. */
+const OUTPUT_CAPTURE_RETRY_MS = 250;
+
 /** Dependencies injected into the leaf engine for tests and alternative runtimes. */
 export interface DelegateEngineDependencies {
 	/** Gateway responsible for all Herdr side effects. */
@@ -39,6 +46,8 @@ export interface DelegateEngineDependencies {
 	now?: () => Date;
 	/** Stable id generator used for transaction and communication names. */
 	id?: () => string;
+	/** Optional delay seam used for bounded terminal-output refresh retries. */
+	sleep?: (milliseconds: number) => Promise<void>;
 }
 
 /** Runtime-only context attached to one leaf engine execution. */
@@ -55,6 +64,14 @@ interface LeafRuntime {
 	agent: string;
 	paneId: string;
 	session?: SessionIdentity;
+}
+
+/** One terminal pane capture together with its parsed or explicit error completion contract. */
+interface CapturedCompletion {
+	/** Parsed child completion or a contract-shaped parser failure after bounded refresh retries. */
+	completion: CompletionContract;
+	/** One-based terminal-output capture attempt count. */
+	attempts: number;
 }
 
 /** Creates a single-line structured event payload from arbitrary task context. */
@@ -340,6 +357,44 @@ export class DelegateEngine {
 		await this.dependencies.gateway.prompt({ target: agent, text: relay, wait: true, timeoutMs, signal });
 	}
 
+	/**
+	 * Captures a child terminal snapshot until a completion contract is visible or the bounded refresh budget is exhausted.
+	 *
+	 * @param runtime Current exact child-pane and session context.
+	 * @returns The first parsed completion contract, or the final parser failure with capture count.
+	 * TEST:engine.test.ts[DelegateEngine rereads a stale terminal snapshot before parsing the completion contract]
+	 */
+	private async captureCompletion(runtime: LeafRuntime): Promise<CapturedCompletion> {
+		const sleep = this.dependencies.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+		let completion: CompletionContract | undefined;
+		for (let attempt = 1; attempt <= MAX_OUTPUT_CAPTURE_ATTEMPTS; attempt += 1) {
+			const output = (await this.dependencies.gateway.readAgent(runtime.agent)).text;
+			try {
+				completion = parseCompletionContract(output);
+				await debug.log("leaf.output.contract-found", {
+					communicationId: runtime.communicationId,
+					agent: runtime.agent,
+					attempt,
+					length: output.length,
+					sha256: hashDebugText(output),
+				}, "trace");
+				return { completion, attempts: attempt };
+			} catch (error) {
+				completion = errorCompletionContract(error);
+				await debug.log("leaf.output.contract-missing", {
+					communicationId: runtime.communicationId,
+					agent: runtime.agent,
+					attempt,
+					maxAttempts: MAX_OUTPUT_CAPTURE_ATTEMPTS,
+					length: output.length,
+					sha256: hashDebugText(output),
+				}, attempt === MAX_OUTPUT_CAPTURE_ATTEMPTS ? "warn" : "trace");
+				if (attempt < MAX_OUTPUT_CAPTURE_ATTEMPTS) await sleep(OUTPUT_CAPTURE_RETRY_MS);
+			}
+		}
+		return { completion: completion!, attempts: MAX_OUTPUT_CAPTURE_ATTEMPTS };
+	}
+
 	/** Reuses an open exact-session pane and blocks on unknown or mismatched transport state. */
 	private async reuseExistingPane(runtime: LeafRuntime, request: DelegateRequest, owner: "parent" | "coordinator"): Promise<HerdrAgentSnapshot | undefined> {
 		if (!request.previousCommunication || !request.previousSession || !request.previousAgent) return undefined;
@@ -432,25 +487,20 @@ export class DelegateEngine {
 				await debug.log("leaf.wait.unknown", { communicationId: runtime.communicationId, agent: runtime.agent, paneId: runtime.paneId }, "warn");
 				return failureResult(runtime, "PARTIAL", "Herdr returned unknown pane state");
 			}
-			let output: string;
+			let captured: CapturedCompletion;
 			try {
-				output = (await this.dependencies.gateway.readAgent(runtime.agent)).text;
+				captured = await this.captureCompletion(runtime);
 				await debug.log("leaf.output.read", {
 					communicationId: runtime.communicationId,
 					agent: runtime.agent,
-					length: output.length,
-					sha256: hashDebugText(output),
+					attempts: captured.attempts,
+					semanticStatus: captured.completion.status,
 				}, "trace");
 			} catch (error) {
 				await debug.log("leaf.output.read-failed", { communicationId: runtime.communicationId, agent: runtime.agent, error: debugError(error) }, "warn");
 				return failureResult(runtime, "PARTIAL", error);
 			}
-			let completion;
-			try {
-				completion = parseCompletionContract(output);
-			} catch (error) {
-				completion = errorCompletionContract(error);
-			}
+			const completion = captured.completion;
 			await appendEvent(runtime.communicationFile, event("result", "child-output-capture", runtime, {
 				status: completion.status,
 				summary: completion.summary,
