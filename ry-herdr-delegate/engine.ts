@@ -244,8 +244,8 @@ export class DelegateEngine {
 					status: existingAgent.status,
 					agentSession: existingAgent.agentSession,
 				}, "debug");
-				await this.dependencies.gateway.prompt({ target: existingAgent.agent, text: relay, wait: false, signal });
-				await debug.log("leaf.relay.sent", { communicationId: runtime.communicationId, agent: existingAgent.agent, paneId: existingAgent.paneId, messageType }, "debug");
+				await this.relayAndAwaitTurn(existingAgent.agent, relay, profile.timeoutMs, signal);
+				await debug.log("leaf.relay.sent", { communicationId: runtime.communicationId, agent: existingAgent.agent, paneId: existingAgent.paneId, messageType, waitForTurn: true }, "debug");
 				return await this.waitAndResolve(runtime, profile.timeoutMs, owner, signal);
 			}
 			await debug.log("leaf.pane.split.start", { communicationId: runtime.communicationId, sourcePaneId: context.sourcePaneId, cwd: runtime.cwd }, "debug");
@@ -313,14 +313,31 @@ export class DelegateEngine {
 				agent: started.agent,
 				cwd: started.cwd,
 			}, undefined, observedSession));
-			await this.dependencies.gateway.prompt({ target: started.agent, text: relay, wait: false, signal });
-			await debug.log("leaf.relay.sent", { communicationId: runtime.communicationId, agent: started.agent, paneId: started.paneId, messageType }, "debug");
+			await this.relayAndAwaitTurn(started.agent, relay, profile.timeoutMs, signal);
+			await debug.log("leaf.relay.sent", { communicationId: runtime.communicationId, agent: started.agent, paneId: started.paneId, messageType, waitForTurn: true }, "debug");
 			return await this.waitAndResolve(runtime, profile.timeoutMs, owner, signal);
 		} catch (error) {
 			await debug.log("leaf.run.failed", { communicationId: runtime.communicationId, transaction: runtime.transaction, stageRole: runtime.stageRole, error: debugError(error) }, "error");
 			await appendEvent(communicationFile, event("error", owner, runtime, { error: error instanceof Error ? error.message : String(error) })).catch(() => undefined);
 			return failureResult(runtime, "ERROR", error);
 		}
+	}
+
+	/**
+	 * Relays a handoff and waits for Herdr to observe a post-submission state transition.
+	 *
+	 * A standalone `agent wait` accepts an already-idle child immediately. Waiting in the
+	 * prompt command prevents output capture before the submitted child turn actually runs.
+	 *
+	 * @param agent Unique Herdr child-agent target.
+	 * @param relay Pointer-only JSONL handoff envelope.
+	 * @param timeoutMs Resolved child-turn deadline.
+	 * @param signal Optional cancellation signal for the Herdr CLI process.
+	 * @returns A promise that settles once Herdr sees the submitted child turn finish.
+	 * TEST:engine.test.ts[DelegateEngine completes a leaf only after exact checkpoint and DONE contract]
+	 */
+	private async relayAndAwaitTurn(agent: string, relay: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+		await this.dependencies.gateway.prompt({ target: agent, text: relay, wait: true, timeoutMs, signal });
 	}
 
 	/** Reuses an open exact-session pane and blocks on unknown or mismatched transport state. */

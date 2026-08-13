@@ -32,6 +32,7 @@ interface FakeGatewayOptions {
 /** Deterministic fake gateway for leaf engine tests. */
 class FakeGateway implements HerdrGateway {
 	readonly calls: string[] = [];
+	lastPrompt?: PromptInput;
 	private readonly childSnapshot: HerdrAgentSnapshot;
 	private readonly output: string;
 	private readonly closedTarget?: string;
@@ -66,7 +67,11 @@ class FakeGateway implements HerdrGateway {
 		// A resumed pane may report a different session; the engine must reject it.
 		return this.startedSession ? { ...this.childSnapshot, agentSession: this.startedSession } : this.childSnapshot;
 	}
-	async prompt(_input: PromptInput): Promise<HerdrAgentSnapshot | undefined> { this.calls.push("prompt"); return this.childSnapshot; }
+	async prompt(input: PromptInput): Promise<HerdrAgentSnapshot | undefined> {
+		this.calls.push("prompt");
+		this.lastPrompt = input;
+		return this.childSnapshot;
+	}
 	async waitFor(_input: WaitInput): Promise<HerdrAgentSnapshot> { this.calls.push("wait"); return this.childSnapshot; }
 	async getAgent(target: string): Promise<HerdrAgentSnapshot> {
 		this.calls.push("get");
@@ -108,6 +113,7 @@ test("DelegateEngine completes a leaf only after exact checkpoint and DONE contr
 			sourcePaneId: "w-test:p1",
 		});
 		assert.equal(result.status, "DONE");
+		assert.deepEqual(gateway.lastPrompt && { wait: gateway.lastPrompt.wait, timeoutMs: gateway.lastPrompt.timeoutMs }, { wait: true, timeoutMs: 300000 });
 		assert.deepEqual(gateway.calls, ["split", "start", "prompt", "wait", "read", "tab-create", "move"]);
 		assert.ok(result.communicationFile.endsWith(".jsonl"));
 		const events = (await readEventLog(result.communicationFile)).events;
