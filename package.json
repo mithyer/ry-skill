@@ -1,6 +1,6 @@
 {
   "name": "ry-skill",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "description": "Custom Pi skills and extensions for fast Herdr workflows.",
   "type": "module",
   "license": "MIT",
@@ -26,19 +26,46 @@
     "ry-herdr-clone/SKILL.md",
     "ry-herdr-fork/index.ts",
     "ry-herdr-fork/SKILL.md",
+    "ry-herdr-delegate/index.ts",
+    "ry-herdr-delegate/tool.ts",
+    "ry-herdr-delegate/types.ts",
+    "ry-herdr-delegate/config.ts",
+    "ry-herdr-delegate/debug.ts",
+    "ry-herdr-delegate/args.ts",
+    "ry-herdr-delegate/records.ts",
+    "ry-herdr-delegate/result.ts",
+    "ry-herdr-delegate/pane-policy.ts",
+    "ry-herdr-delegate/engine.ts",
+    "ry-herdr-delegate/pipeline.ts",
+    "ry-herdr-delegate/pipeline-coordinator.ts",
+    "ry-herdr-delegate/coordinator-store.ts",
+    "ry-herdr-delegate/herdr/**/*.ts",
     "ry-herdr-delegate/SKILL.md",
     "ry-herdr-delegate/config.example.json",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test ry-herdr-fork/index.test.ts ry-herdr-clone/index.test.ts"
+    "test": "node --test ry-herdr-fork/index.test.ts ry-herdr-clone/index.test.ts ry-herdr-delegate/*.test.ts ry-herdr-delegate/herdr/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   },
+  "dependencies": {
+    "proper-lockfile": "^4.1.2"
+  },
+  "bundledDependencies": [
+    "proper-lockfile"
+  ],
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^24.12.4",
+    "@types/proper-lockfile": "^4.1.4",
+    "proper-lockfile": "^4.1.2",
+    "typebox": "^1.3.7",
+    "typescript": "^5.9.3"
   },
   "publishConfig": {
     "access": "public"
@@ -46,12 +73,12 @@
   "pi": {
     "extensions": [
       "./ry-herdr-fork/index.ts",
-      "./ry-herdr-clone/index.ts"
+      "./ry-herdr-clone/index.ts",
+      "./ry-herdr-delegate/index.ts"
     ],
     "skills": [
       "./ry-herdr-fork",
-      "./ry-herdr-clone",
-      "./ry-herdr-delegate"
+      "./ry-herdr-clone"
     ]
   }
 }

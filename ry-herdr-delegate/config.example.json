@@ -5,6 +5,10 @@
     "panePolicy": "new-tab",
     "env": {}
   },
+  "debug": {
+    "level": "off",
+    "directory": ".pi/agent/ry-herdr-delegate/debug"
+  },
   "agents": {
     "codex": {
       "kind": "codex",
