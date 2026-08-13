@@ -35,7 +35,8 @@ function agentResponse(): string {
 	return JSON.stringify({
 		result: {
 			agent: {
-				agent: "worker-test",
+				name: "worker-test",
+				agent: "codex",
 				agent_status: "idle",
 				pane_id: "w-test:p2",
 				workspace_id: "w-test",
@@ -100,6 +101,7 @@ test("HerdrCliGateway uses the validated spawn boundary", async () => {
 	});
 	assert.equal(pane.paneId, "w-test:p2");
 	const started = await gateway.startAgent({ name: "worker-test", kind: "codex", paneId: pane.paneId, agentArgs: ["--yolo"] });
+	assert.equal(started.agent, "worker-test");
 	assert.equal(started.agentSession?.value, "session-test");
 	const prompted = await gateway.prompt({ target: started.agent, text: "relay", wait: true, timeoutMs: 25 });
 	assert.equal(prompted?.paneId, "w-test:p2");
@@ -119,6 +121,7 @@ test("HerdrCliGateway uses the validated spawn boundary", async () => {
 	assert.deepEqual(startCall.args.slice(-2), ["--", "--yolo"]);
 	const promptCall = calls.find((call) => call.args[0] === "agent" && call.args[1] === "prompt");
 	assert.ok(promptCall);
+	assert.deepEqual(promptCall.args.slice(0, 3), ["agent", "prompt", "worker-test"]);
 	assert.deepEqual(promptCall.args.slice(-4), ["relay", "--wait", "--timeout", "25"]);
 	const waitCall = calls.find((call) => call.args[0] === "agent" && call.args[1] === "wait");
 	assert.ok(waitCall);

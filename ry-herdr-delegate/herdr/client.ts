@@ -129,7 +129,10 @@ function normalizeAgent(value: unknown, fallbackTarget?: string): HerdrAgentSnap
 	let record = asRecord(unwrapResult(value));
 	if (!record) throw new HerdrCapabilityError("Herdr agent response is not an object", []);
 	if (asRecord(record.agent)) record = asRecord(record.agent)!;
-	const agent = typeof record.agent === "string" ? record.agent : fallbackTarget;
+	// Herdr exposes `agent` as the implementation kind (for example, `pi`) and `name` as the unique prompt target.
+	const agent = typeof record.name === "string" && record.name.length > 0
+		? record.name
+		: fallbackTarget ?? (typeof record.agent === "string" ? record.agent : undefined);
 	if (!agent) throw new HerdrCapabilityError("Herdr agent response is missing agent", []);
 	const statusValue = record.agent_status ?? record.status;
 	const status: AgentTransportStatus =
