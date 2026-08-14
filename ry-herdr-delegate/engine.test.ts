@@ -174,6 +174,42 @@ test("DelegateEngine rereads a stale terminal snapshot before parsing the comple
 	}
 });
 
+/** Covers narrow-pane terminal refreshes that expose the contract only after the original retry budget. */
+test("DelegateEngine keeps rereading a slow terminal refresh within the bounded budget", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-slow-output-refresh-"));
+	try {
+		const gateway = new FakeGateway("STATUS: DONE\nSUMMARY: unused\nVALIDATION: unused", "done", true, {
+			outputs: [
+				"terminal output is still fragmented",
+				"terminal output is still fragmented",
+				"terminal output is still fragmented",
+				"terminal output is still fragmented",
+				"terminal output is still fragmented",
+				"STATUS: DONE\nSUMMARY: delayed refresh\nVALIDATION: captured after rereads",
+			],
+		});
+		const delays: number[] = [];
+		const engine = new DelegateEngine({
+			gateway,
+			config: parseDelegateConfig({ version: 1 }),
+			communicationDirectory: join(root, "communications"),
+			id: () => "slow-output-refresh",
+			sleep: async (milliseconds) => { delays.push(milliseconds); },
+		});
+		const result = await engine.run({ action: "delegate", task: "capture slow output", role: "worker" }, {
+			cwd: "/tmp/project",
+			workspaceId: "w-test",
+			sourcePaneId: "w-test:p1",
+		});
+		assert.equal(result.status, "DONE");
+		assert.equal(result.completion?.summary, "delayed refresh");
+		assert.equal(gateway.calls.filter((call) => call === "read").length, 6);
+		assert.deepEqual(delays, [250, 250, 250, 250, 250]);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test("DelegateEngine falls back to the exact Pi session when Herdr terminal rows wrap", async () => {
 	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-session-fallback-"));
 	try {
