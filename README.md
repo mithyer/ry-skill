@@ -141,6 +141,22 @@ that file.
 The extension does not silently fall back to the old skill, an external
 `herdr_delegate`, a fresh coordinator, or a latest-session recovery command.
 
+#### Direct invocation and automatic routing
+
+`/ry-herdr-delegate <task>` executes one leaf task through
+`ry_herdr_delegate_tool` and reports its structured status. It is an execution
+command, not a status-only command.
+
+Before the model loop, the extension also detects an explicit actionable agent
+directive such as `请使用 codex 修复这个问题`, `使用 Claude 审查这次修改`, or
+`use Codex to implement this change`. It routes the original prompt directly to
+the selected external agent with the `worker` profile and marks the input as
+handled, so the model does not execute the same request a second time.
+
+Incidental mentions such as `Codex 和 Claude 有什么区别？`, negative requests
+such as `不要使用 codex`, slash commands, non-TUI input, and prompts received
+while Pi is already busy are left to normal Pi handling.
+
 ### Zero-history Invocation
 
 Use the extension commands or their skill aliases:

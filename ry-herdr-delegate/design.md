@@ -25,7 +25,7 @@
 
 runtime 进程边界固定为本项目的 `HerdrCliGateway`：它使用 `node:child_process.spawn`、argv 数组、`shell: false`、显式合并的 `cwd`/`env`、AbortSignal/timeout 和 stdout/stderr 捕获。`pi.exec` 只继续用于现有 `ry-herdr-fork`/`ry-herdr-clone` 启动器，不是新 delegate gateway 的执行边界。
 
-自然语言意图识别和复杂任务拆解仍可由当前 Pi 模型完成，但模型必须把结果转换为结构化的 `ry_herdr_delegate_tool` 调用。不能把关键副作用继续留给 prompt 约束。
+一般自然语言意图识别和复杂任务拆解仍可由当前 Pi 模型完成；但 extension 会在模型回合前识别有限且明确的 agent 工作指令（例如“使用 Codex 修复”或“使用 Claude 审查”），直接转换为 `ry_herdr_delegate_tool` 的 `delegate` action，并将原提示词作为 task。闲聊、否定句、slash command、非 TUI 输入和 Pi 忙碌时不会自动拦截。其余复杂意图仍必须由模型转换为结构化的 `ry_herdr_delegate_tool` 调用。不能把关键副作用继续留给 prompt 约束。
 
 `pipeline` 是特殊的后台提交入口，不由主 Pi 执行 stage loop。主 Pi 只创建或复用当前 Herdr workspace 中的长期 `pipeline-coordinator` 子 agent，写入 pipeline 请求并返回 `pipelineId`；coordinator 子 agent 在自己的 Pi session 和 pane 中负责规划、调度、等待、恢复和汇总。主 Pi 可以继续处理新的用户消息。
 

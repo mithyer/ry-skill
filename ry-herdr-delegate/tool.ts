@@ -5,7 +5,10 @@ import { join } from "node:path";
 import type {
 	AgentToolResult,
 	ExtensionAPI,
+	ExtensionCommandContext,
 	ExtensionContext,
+	InputEvent,
+	InputEventResult,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
@@ -48,8 +51,10 @@ export const DelegateToolParameters = Type.Object({
 	answer: Type.Optional(Type.String()),
 });
 
-/** Inferred structured tool parameters. */
-export type DelegateToolParams = Static<typeof DelegateToolParameters>;
+/** Inferred structured tool parameters with an explicit action union for direct construction. */
+export type DelegateToolParams = Omit<Static<typeof DelegateToolParameters>, "action"> & {
+	action: typeof ACTIONS[number];
+};
 
 /** Result details returned to Pi's tool renderer and transcript. */
 export interface DelegateToolDetails {
@@ -67,6 +72,41 @@ export interface DelegateToolDetails {
 	communicationFile?: string;
 	/** Human-readable error or unsupported-action explanation. */
 	error?: string;
+}
+
+/** Agents that can be selected by an explicit natural-language delegation directive. */
+export type AutomaticDelegateAgent = "codex" | "claude";
+
+/** Parsed direct-delegation request from an actionable user prompt. */
+export interface AutomaticDelegateRequest {
+	/** External agent explicitly selected by the user. */
+	agent: AutomaticDelegateAgent;
+	/** Original prompt preserved as the child task. */
+	task: string;
+}
+
+/** Explicit verbs that distinguish a delegation request from an incidental agent mention. */
+const AUTOMATIC_AGENT_DIRECTIVE = /(?:使用|用|调用|交给|让|请(?:使用|用|调用|让)?|use|using|ask|have|let)\s*(?:agent\s*)?(codex|claude)\b/iu;
+
+/** Negative directives must never be converted into an external-agent execution. */
+const AUTOMATIC_AGENT_NEGATION = /(?:不要|不用|不使用|无需|without|don't|do not|not)\s*(?:使用|用|调用|use|using)?\s*(?:agent\s*)?(codex|claude)\b/iu;
+
+/** Minimal work-intent vocabulary required before automatic routing is allowed. */
+const AUTOMATIC_WORK_INTENT = /(?:帮我|帮忙|处理|解决|修复|实现|修改|编写|重构|排查|调试|审查|评审|研究|调查|执行|运行|测试|部署|查看|检查|fix|implement|change|write|refactor|debug|review|research|investigate|execute|run|test|build|deploy|check|inspect)/iu;
+
+/**
+ * Detects an explicit Codex/Claude work directive without treating incidental mentions as execution requests.
+ * @param text Raw user prompt received before the agent loop.
+ * @returns The selected agent and original task, or undefined when no direct route is safe.
+ * TEST:ry-herdr-delegate/tool.test.ts[detectAutomaticDelegateRequest]
+ */
+export function detectAutomaticDelegateRequest(text: string): AutomaticDelegateRequest | undefined {
+	const task = text.trim();
+	if (!task || task.startsWith("/") || AUTOMATIC_AGENT_NEGATION.test(task) || !AUTOMATIC_WORK_INTENT.test(task)) return undefined;
+	const match = task.match(AUTOMATIC_AGENT_DIRECTIVE);
+	const agent = match?.[1]?.toLowerCase();
+	if (agent !== "codex" && agent !== "claude") return undefined;
+	return { agent, task };
 }
 
 /** Global configuration path used by the extension and debug context. */
@@ -149,6 +189,92 @@ export async function executeDelegateTool(
 			throw error;
 		}
 	});
+}
+
+/** Direct leaf overrides shared by the slash command and automatic input router. */
+interface DirectDelegateOverrides {
+	/** Configured runtime role used for timeout/profile resolution. */
+	role: string;
+	/** Optional explicit external agent selected by the user. */
+	agent?: AutomaticDelegateAgent;
+}
+
+type DelegateExecutor = (
+	params: DelegateToolParams,
+	ctx: ExtensionContext,
+	signal?: AbortSignal,
+) => Promise<AgentToolResult<DelegateToolDetails>>;
+
+/** Formats a compact user-facing result without dumping task text or child output. */
+function formatDelegateNotification(result: AgentToolResult<DelegateToolDetails>): string {
+	const details = result.details;
+	const status = details?.status ?? "UNKNOWN";
+	const summary = details?.result?.completion?.summary ?? details?.error;
+	const communicationFile = details?.communicationFile;
+	return [
+		`ry_herdr_delegate_tool: ${status}`,
+		summary ? `SUMMARY: ${summary}` : undefined,
+		communicationFile ? `COMMUNICATION: ${communicationFile}` : undefined,
+	].filter((line): line is string => line !== undefined).join("\n");
+}
+
+/** Shows the direct delegate result while keeping the command and input paths consistent. */
+function delegateNotificationType(result: AgentToolResult<DelegateToolDetails>): "info" | "warning" | "error" {
+	if (result.details?.status === "ERROR") return "error";
+	return result.details?.status === "DONE" ? "info" : "warning";
+}
+
+/** Runs one direct leaf request and reports its structured status through the Pi UI. */
+async function runDirectDelegate(
+	task: string,
+	ctx: ExtensionContext,
+	overrides: DirectDelegateOverrides,
+	executor: DelegateExecutor,
+): Promise<void> {
+	ctx.ui.setWorkingMessage("Running Herdr delegate...");
+	ctx.ui.setWorkingVisible(true);
+	try {
+		const result = await executor({ action: "delegate", task, role: overrides.role, agent: overrides.agent }, ctx, ctx.signal);
+		ctx.ui.notify(formatDelegateNotification(result), delegateNotificationType(result));
+	} catch (error) {
+		ctx.ui.notify(`ry_herdr_delegate_tool: ERROR\n${error instanceof Error ? error.message : String(error)}`, "error");
+	} finally {
+		ctx.ui.setWorkingVisible(false);
+		ctx.ui.setWorkingMessage();
+	}
+}
+
+/**
+ * Creates the slash-command handler that executes a supplied task as a leaf.
+ * @param executor Runtime executor, injectable for command regression tests.
+ * @returns A Pi command handler accepting the task after `/ry-herdr-delegate`.
+ * TEST:ry-herdr-delegate/tool.test.ts[createDelegateCommandHandler]
+ */
+export function createDelegateCommandHandler(executor: DelegateExecutor = executeDelegateTool): (args: string, ctx: ExtensionCommandContext) => Promise<void> {
+	return async (args, ctx) => {
+		const task = args.trim();
+		if (!task) {
+			ctx.ui.notify("Usage: /ry-herdr-delegate <task>", "warning");
+			return;
+		}
+		await runDirectDelegate(task, ctx, { role: "delegate" }, executor);
+	};
+}
+
+/**
+ * Creates the pre-agent input handler for explicit Codex/Claude work directives.
+ * @param executor Runtime executor, injectable for automatic-routing regression tests.
+ * @returns A Pi input handler that handles only actionable direct-agent prompts.
+ * TEST:ry-herdr-delegate/tool.test.ts[createAutomaticDelegateInputHandler]
+ */
+export function createAutomaticDelegateInputHandler(executor: DelegateExecutor = executeDelegateTool): (event: InputEvent, ctx: ExtensionContext) => Promise<InputEventResult> {
+	return async (event, ctx) => {
+		if (event.source === "extension" || event.streamingBehavior || ctx.mode !== "tui" || !ctx.isIdle()) return { action: "continue" };
+		const request = detectAutomaticDelegateRequest(event.text);
+		if (!request) return { action: "continue" };
+		await runDirectDelegate(request.task, ctx, { role: "worker", agent: request.agent }, executor);
+		return { action: "handled" };
+	};
 }
 
 /** Executes one request after configuration and the request-scoped logger are initialized. */
@@ -271,7 +397,7 @@ async function executeDelegateToolWithConfig(
 	return toolResult({ status: result.status, result, communicationFile: result.communicationFile }, result.status === "ERROR");
 }
 
-/** Registers the structured tool and a small command alias for manual inspection. */
+/** Registers the structured tool, executable slash command, and direct-agent input router. */
 export function registerDelegateTool(pi: ExtensionAPI): void {
 	const definition: ToolDefinition<typeof DelegateToolParameters, DelegateToolDetails> = {
 		name: "ry_herdr_delegate_tool",
@@ -285,9 +411,8 @@ export function registerDelegateTool(pi: ExtensionAPI): void {
 	};
 	pi.registerTool(definition);
 	pi.registerCommand("ry-herdr-delegate", {
-		description: "Show the structured Herdr delegate runtime status",
-		handler: async (_args, ctx) => {
-			ctx.ui.notify("ry_herdr_delegate_tool: leaf, pipeline, and exact JSONL recovery actions are enabled; live smoke remains an explicit validation step", "info");
-		},
+		description: "Execute one Herdr delegate leaf task: /ry-herdr-delegate <task>",
+		handler: createDelegateCommandHandler(),
 	});
+	pi.on("input", createAutomaticDelegateInputHandler());
 }

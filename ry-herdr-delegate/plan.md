@@ -29,7 +29,7 @@
 - 不重写 `ry-herdr-fork` 或 `ry-herdr-clone`。
 - 不把两个 `pi-herdr` 包加入 runtime dependency。
 - 状态查询和持久 JSONL event log 是唯一正确性来源。
-- 不在 Extension 中硬编码完整自然语言意图分类；结构化 tool request 才是权威入口。
+- 不在 Extension 中硬编码完整自然语言意图分类；只识别明确的 Codex/Claude 工作指令并直接转为结构化 `delegate` request，其他意图仍以结构化 tool request 为权威入口。
 - 不使用 `--last`、`--continue`、fresh agent 或随机 session 代替 exact-session recovery。
 - 不在第一阶段同时实现所有高级 pipeline 并发策略；先完成串行、可恢复的单 pipeline vertical slice。
 
