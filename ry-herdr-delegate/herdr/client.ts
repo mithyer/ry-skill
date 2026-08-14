@@ -511,11 +511,22 @@ export class HerdrCliGateway implements HerdrGateway {
 		const args = ["agent", "prompt", input.target, input.text];
 		if (input.wait) args.push("--wait");
 		if (input.timeoutMs !== undefined) args.push("--timeout", String(input.timeoutMs));
-		const result = await this.runJson(args, input.signal, input.timeoutMs ?? this.timeoutMs);
 		try {
-			return normalizeAgent(result, input.target);
-		} catch {
-			return undefined;
+			const result = await this.runJson(args, input.signal, input.timeoutMs ?? this.timeoutMs);
+			try {
+				return normalizeAgent(result, input.target);
+			} catch {
+				return undefined;
+			}
+		} catch (error) {
+			// Herdr 0.8 can report a completed fast turn as stalled when its state sequence never leaves idle.
+			if (!input.wait || herdrErrorCode(error) !== "agent_prompt_stalled") throw error;
+			await this.debugLogger.log("herdr.agent.prompt-stalled", {
+				target: input.target,
+				timeoutMs: input.timeoutMs,
+				fallback: "get-agent",
+			}, "warn");
+			return await this.getAgent(input.target);
 		}
 	}
 

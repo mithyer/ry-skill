@@ -138,6 +138,25 @@ test("HerdrCliGateway uses the validated spawn boundary", async () => {
 	assert.deepEqual(moveCall.args, ["pane", "move", "w-test:p2", "--new-tab", "--label", "closed-pane-test", "--workspace", "w-test", "--no-focus"]);
 });
 
+/** Treats Herdr's idle-state prompt stall as a completed fast turn without resending the relay. */
+test("HerdrCliGateway recovers agent_prompt_stalled from current agent metadata", async () => {
+	const calls: SpawnCall[] = [];
+	const spawnProcess: SpawnProcess = (command, args, options) => {
+		calls.push({ command, args: [...args], options });
+		if (args[0] === "agent" && args[1] === "prompt") {
+			return fakeChild(JSON.stringify({ error: { code: "agent_prompt_stalled", message: "agent prompt produced no observed state change" } }), 1);
+		}
+		if (args[0] === "agent" && args[1] === "get") return fakeChild(agentResponse());
+		return fakeChild(JSON.stringify({ result: { ok: true } }));
+	};
+	const gateway = new HerdrCliGateway({ command: "herdr-test", cwd: "/tmp/project", spawnProcess });
+	const prompted = await gateway.prompt({ target: "worker-test", text: "relay", wait: true, timeoutMs: 25 });
+	assert.equal(prompted?.agent, "worker-test");
+	assert.equal(prompted?.agentSession?.value, "session-test");
+	assert.equal(calls.filter((call) => call.args[0] === "agent" && call.args[1] === "prompt").length, 1);
+	assert.equal(calls.filter((call) => call.args[0] === "agent" && call.args[1] === "get").length, 1);
+});
+
 /** Checks a newly split shell retries only Herdr's explicit transient pane-busy startup result. */
 test("HerdrCliGateway retries transient agent_pane_busy startup", async () => {
 	const calls: SpawnCall[] = [];
