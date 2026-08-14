@@ -18,6 +18,11 @@ test("completion contract parsing distinguishes DONE from incomplete output", ()
 	assert.equal(tuiDecorated.status, "DONE");
 	assert.equal(tuiDecorated.summary, "rendered through an agent TUI");
 	assert.equal(isSemanticDone(tuiDecorated), true);
+	const arbitraryPrefixes = parseCompletionContract("xSTATUS: DONE\n>>SUMMARY: rendered through arbitrary prefixes\n VALIDATION: no files changed\n");
+	assert.equal(arbitraryPrefixes.status, "DONE");
+	assert.equal(arbitraryPrefixes.summary, "rendered through arbitrary prefixes");
+	assert.equal(isSemanticDone(arbitraryPrefixes), true);
+	assert.throws(() => parseCompletionContract("abcSTATUS: DONE\nSUMMARY: too many prefix characters\nVALIDATION: no files changed\n"), /STATUS/);
 	assert.equal(errorCompletionContract(new Error("bad")).status, "ERROR");
 	assert.throws(() => parseCompletionContract("STATUS: DONE\nSUMMARY: missing validation"), /VALIDATION/);
 });
