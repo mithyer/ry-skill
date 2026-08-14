@@ -45,6 +45,12 @@ const AGENT_START_ATTEMPTS = 30;
 /** Delay between explicit `agent_pane_busy` startup retries. */
 const AGENT_START_RETRY_MS = 100;
 
+/** Maximum attempts while Herdr publishes exact session metadata after agent startup. */
+const AGENT_SESSION_ATTEMPTS = 30;
+
+/** Delay between exact session metadata reads during startup stabilization. */
+const AGENT_SESSION_RETRY_MS = 100;
+
 /** Structured error raised when Herdr cannot satisfy a CLI capability. */
 export class HerdrCapabilityError extends Error {
 	/** CLI argument vector associated with the unsupported operation. */
@@ -406,6 +412,29 @@ export class HerdrCliGateway implements HerdrGateway {
 	}
 
 	/**
+	 * Waits for the exact session identity to become visible after Herdr starts an agent.
+	 *
+	 * @param target Agent name returned by the start command.
+	 * @returns The latest normalized agent snapshot, including exact session metadata when available.
+	 */
+	private async getStartedAgent(target: string): Promise<HerdrAgentSnapshot> {
+		let snapshot: HerdrAgentSnapshot | undefined;
+		for (let attempt = 1; attempt <= AGENT_SESSION_ATTEMPTS; attempt += 1) {
+			snapshot = await this.getAgent(target);
+			if (snapshot.agentSession) return snapshot;
+			if (attempt === AGENT_SESSION_ATTEMPTS) break;
+			await this.debugLogger.log("herdr.agent.session.retry", {
+				target,
+				attempt,
+				maxAttempts: AGENT_SESSION_ATTEMPTS,
+				retryMs: AGENT_SESSION_RETRY_MS,
+			}, "trace");
+			await this.sleep(AGENT_SESSION_RETRY_MS);
+		}
+		return snapshot!;
+	}
+
+	/**
 	 * Starts a supported agent with its final validated argv.
 	 *
 	 * @param input Agent name, kind, pane, and argv.
@@ -419,7 +448,7 @@ export class HerdrCliGateway implements HerdrGateway {
 		for (let attempt = 1; attempt <= AGENT_START_ATTEMPTS; attempt += 1) {
 			try {
 				await this.runJson(args);
-				return this.getAgent(input.name);
+				return this.getStartedAgent(input.name);
 			} catch (error) {
 				if (!isTransientAgentPaneBusy(error) || attempt === AGENT_START_ATTEMPTS) throw error;
 				await this.debugLogger.log("herdr.agent.start.retry", {

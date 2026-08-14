@@ -167,7 +167,42 @@ test("HerdrCliGateway retries transient agent_pane_busy startup", async () => {
 	assert.deepEqual(delays, [100]);
 	assert.equal(calls.filter((call) => call.args[0] === "agent" && call.args[1] === "start").length, 2);
 });
-
+/** Verifies startup waits briefly for Herdr's exact session metadata to become visible after the process starts. */
+test("HerdrCliGateway retries delayed agent_session metadata", async () => {
+	const delays: number[] = [];
+	let getAttempts = 0;
+	const spawnProcess: SpawnProcess = (_command, args, _options) => {
+		if (args[0] === "agent" && args[1] === "get") {
+			getAttempts += 1;
+			return fakeChild(JSON.stringify({
+				result: {
+					agent: {
+						name: "worker-test",
+						agent: "claude",
+						agent_status: "idle",
+						pane_id: "w-test:p2",
+						workspace_id: "w-test",
+						tab_id: "w-test:t1",
+						cwd: "/tmp/project",
+						...(getAttempts > 1 ? { agent_session: { kind: "id", source: "herdr:claude", value: "delayed-session" } } : {}),
+					},
+				},
+			}));
+		}
+		return fakeChild(JSON.stringify({ result: { ok: true } }));
+	};
+	const gateway = new HerdrCliGateway({
+		command: "herdr-test",
+		cwd: "/tmp/project",
+		spawnProcess,
+		sleep: async (milliseconds) => { delays.push(milliseconds); },
+	});
+	const started = await gateway.startAgent({ name: "worker-test", kind: "claude", paneId: "w-test:p2", agentArgs: ["--dangerously-skip-permissions"] });
+	assert.equal(started.agentSession?.value, "delayed-session");
+	assert.equal(getAttempts, 2);
+	assert.deepEqual(delays, [100]);
+});
+/** Reports command failures with captured evidence. */
 test("HerdrCliGateway reports command failures with captured evidence", async () => {
 	const spawnProcess: SpawnProcess = (_command, _args, _options) => fakeChild("", 7, "SIGTERM");
 	const gateway = new HerdrCliGateway({ cwd: "/tmp/project", spawnProcess });
