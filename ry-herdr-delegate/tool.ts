@@ -155,7 +155,7 @@ export function formatDelegateToolResult(details: DelegateToolDetails): string {
 	}
 	if (details.error) lines.push(`Error: ${details.error}`);
 	if (lines.length === 0) lines.push(`Herdr delegate: ${details.status}`);
-	return lines.join("\\n");
+	return lines.join("\n");
 }
 
 /** Minimal structural renderer contract accepted by Pi's custom tool slots. */

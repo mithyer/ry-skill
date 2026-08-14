@@ -84,7 +84,7 @@ test("formatDelegateToolResult hides raw delegation metadata", () => {
 			},
 		},
 	});
-	assert.equal(summary, "Pipeline QUEUED: pipeline-demo\\nCoordinator pane: w-test:p2");
+	assert.equal(summary, "Pipeline QUEUED: pipeline-demo\nCoordinator pane: w-test:p2");
 	assert.doesNotMatch(summary, /communicationFile|agentSession|private|\\{/);
 });
 
@@ -149,7 +149,7 @@ test("createDelegateCommandHandler executes the supplied task", async () => {
 });
 
 /** Verifies the extension registers both executable direct-entry surfaces. */
-	test("registerDelegateTool wires the executable command and input router", () => {
+test("registerDelegateTool wires the executable command and input router", () => {
 	let toolRegistered = false;
 	let renderCallRegistered = false;
 	let renderResultRegistered = false;
