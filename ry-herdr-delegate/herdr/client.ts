@@ -525,7 +525,7 @@ export class HerdrCliGateway implements HerdrGateway {
 		const args = ["pane", "move", input.paneId];
 		if (input.tabId) args.push("--tab", input.tabId);
 		if (input.newTab) args.push("--new-tab");
-		if (input.tabLabel) args.push("--tab-label", input.tabLabel);
+		if (input.tabLabel) args.push(input.newTab ? "--label" : "--tab-label", input.tabLabel);
 		if (input.workspaceId) args.push("--workspace", input.workspaceId);
 		args.push(input.focus ? "--focus" : "--no-focus");
 		const raw = unwrapResult(await this.runJson(args));

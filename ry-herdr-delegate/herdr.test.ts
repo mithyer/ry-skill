@@ -135,7 +135,7 @@ test("HerdrCliGateway uses the validated spawn boundary", async () => {
 	assert.deepEqual(waitCall.args.slice(-6), ["--until", "idle", "--until", "done", "--timeout", "25"]);
 	const moveCall = calls.find((call) => call.args[0] === "pane" && call.args[1] === "move");
 	assert.ok(moveCall);
-	assert.deepEqual(moveCall.args, ["pane", "move", "w-test:p2", "--new-tab", "--tab-label", "closed-pane-test", "--workspace", "w-test", "--no-focus"]);
+	assert.deepEqual(moveCall.args, ["pane", "move", "w-test:p2", "--new-tab", "--label", "closed-pane-test", "--workspace", "w-test", "--no-focus"]);
 });
 
 /** Checks a newly split shell retries only Herdr's explicit transient pane-busy startup result. */

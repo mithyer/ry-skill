@@ -3,6 +3,7 @@ import test from "node:test";
 
 import type {
 	AgentToolResult,
+	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
 	InputEvent,
@@ -12,6 +13,7 @@ import {
 	createAutomaticDelegateInputHandler,
 	createDelegateCommandHandler,
 	detectAutomaticDelegateRequest,
+	registerDelegateTool,
 	type DelegateToolDetails,
 	type DelegateToolParams,
 } from "./tool.ts";
@@ -97,4 +99,27 @@ test("createDelegateCommandHandler executes the supplied task", async () => {
 	assert.equal(calls[0].action, "delegate");
 	assert.equal(calls[0].role, "delegate");
 	assert.equal(calls[0].task, "fix the requested issue");
+});
+
+/** Verifies the extension registers both executable direct-entry surfaces. */
+test("registerDelegateTool wires the executable command and input router", () => {
+	let toolRegistered = false;
+	let commandName: string | undefined;
+	let commandDescription: string | undefined;
+	let inputRegistered = false;
+	const extensionApi = {
+		registerTool: () => { toolRegistered = true; },
+		registerCommand: (name: string, options: { description?: string }) => {
+			commandName = name;
+			commandDescription = options.description;
+		},
+		on: (event: string) => {
+			if (event === "input") inputRegistered = true;
+		},
+	} as unknown as ExtensionAPI;
+	registerDelegateTool(extensionApi);
+	assert.equal(toolRegistered, true);
+	assert.equal(commandName, "ry-herdr-delegate");
+	assert.match(commandDescription ?? "", /Execute one Herdr delegate leaf task/);
+	assert.equal(inputRegistered, true);
 });
