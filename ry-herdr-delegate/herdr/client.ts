@@ -51,6 +51,12 @@ const AGENT_SESSION_ATTEMPTS = 30;
 /** Delay between exact session metadata reads during startup stabilization. */
 const AGENT_SESSION_RETRY_MS = 100;
 
+/** Maximum time allowed for the fixed no-op prompt that establishes external-agent session identity. */
+const AGENT_SESSION_BOOTSTRAP_TIMEOUT_MS = 10_000;
+
+/** Fixed no-op prompt used only to make an external session identity observable before task relay. */
+const AGENT_SESSION_BOOTSTRAP_PROMPT = "RY_HERDR_SESSION_BOOTSTRAP: Do not modify files, run commands, or delegate. Reply exactly: READY";
+
 /** Structured error raised when Herdr cannot satisfy a CLI capability. */
 export class HerdrCapabilityError extends Error {
 	/** CLI argument vector associated with the unsupported operation. */
@@ -435,6 +441,34 @@ export class HerdrCliGateway implements HerdrGateway {
 	}
 
 	/**
+	 * Sends a fixed no-op turn when an external CLI has not published its session identity yet.
+	 *
+	 * @param target Agent name returned by the start command.
+	 * @returns A promise that settles after the bounded bootstrap attempt.
+	 */
+	private async bootstrapAgentSession(target: string): Promise<void> {
+		await this.debugLogger.log("herdr.agent.session.bootstrap.start", {
+			target,
+			timeoutMs: AGENT_SESSION_BOOTSTRAP_TIMEOUT_MS,
+		});
+		try {
+			await this.prompt({
+				target,
+				text: AGENT_SESSION_BOOTSTRAP_PROMPT,
+				wait: true,
+				timeoutMs: AGENT_SESSION_BOOTSTRAP_TIMEOUT_MS,
+			});
+			await this.debugLogger.log("herdr.agent.session.bootstrap.result", { target });
+		} catch (error) {
+			// Onboarding or authentication can block the probe; the caller still fails closed below.
+			await this.debugLogger.log("herdr.agent.session.bootstrap.error", {
+				target,
+				error: debugError(error),
+			}, "warn");
+		}
+	}
+
+	/**
 	 * Starts a supported agent with its final validated argv.
 	 *
 	 * @param input Agent name, kind, pane, and argv.
@@ -448,6 +482,9 @@ export class HerdrCliGateway implements HerdrGateway {
 		for (let attempt = 1; attempt <= AGENT_START_ATTEMPTS; attempt += 1) {
 			try {
 				await this.runJson(args);
+				const initial = await this.getAgent(input.name);
+				if (initial.agentSession) return initial;
+				await this.bootstrapAgentSession(input.name);
 				return this.getStartedAgent(input.name);
 			} catch (error) {
 				if (!isTransientAgentPaneBusy(error) || attempt === AGENT_START_ATTEMPTS) throw error;
