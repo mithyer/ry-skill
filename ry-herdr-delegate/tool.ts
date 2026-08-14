@@ -2,7 +2,6 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { Text } from "@earendil-works/pi-tui";
 import type {
 	AgentToolResult,
 	ExtensionAPI,
@@ -159,9 +158,38 @@ export function formatDelegateToolResult(details: DelegateToolDetails): string {
 	return lines.join("\\n");
 }
 
+/** Minimal structural renderer contract accepted by Pi's custom tool slots. */
+interface DelegateRenderComponent {
+	/** Renders the component for the current terminal width. */
+	render(width: number): string[];
+	/** Invalidates component-local rendering caches. */
+	invalidate(): void;
+}
+
+/** Minimal Pi component used to render one compact styled tool row without importing pi-tui at runtime. */
+class DelegateTextComponent implements DelegateRenderComponent {
+	/** Styled one-line output retained between Pi render passes. */
+	private readonly text: string;
+
+	/** Creates a stable one-line component for the tool renderer. */
+	constructor(text: string) {
+		this.text = text;
+	}
+
+	/** Returns the styled row independently of the available terminal width. */
+	render(_width: number): string[] {
+		return [this.text];
+	}
+
+	/** Invalidates no caches because the component owns immutable text. */
+	invalidate(): void {
+		return;
+	}
+}
+
 /** Formats the tool call header without exposing task text or structured arguments. */
-function formatDelegateToolCall(args: Partial<DelegateToolParams>, theme: Theme): Text {
-	return new Text(theme.fg("toolTitle", `Herdr Delegate · ${args.action ?? "request"}`), 0, 0);
+function formatDelegateToolCall(args: Partial<DelegateToolParams>, theme: Theme): DelegateRenderComponent {
+	return new DelegateTextComponent(theme.fg("toolTitle", `Herdr Delegate · ${args.action ?? "request"}`));
 }
 
 /** Renders the compact result row while the full state remains in details and JSONL. */
@@ -170,11 +198,11 @@ function renderDelegateToolResult(
 	options: ToolRenderResultOptions,
 	theme: Theme,
 	isError: boolean,
-): Text {
-	if (options.isPartial) return new Text(theme.fg("warning", "Herdr Delegate · working..."), 0, 0);
+): DelegateRenderComponent {
+	if (options.isPartial) return new DelegateTextComponent(theme.fg("warning", "Herdr Delegate · working..."));
 	const summary = formatDelegateToolResult(result.details ?? { status: "UNKNOWN" });
 	const color = isError ? "error" : result.details?.status === "DONE" ? "success" : "accent";
-	return new Text(theme.fg(color, summary), 0, 0);
+	return new DelegateTextComponent(theme.fg(color, summary));
 }
 
 /** Formats a result into compact Pi text while retaining structured details for runtime consumers. */
