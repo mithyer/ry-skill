@@ -1,9 +1,9 @@
 # ry-herdr-delegate 实施计划
 
-> 状态：Phase 0-4 的主要 runtime 路径、pipeline recovery 和发布前自动化硬化已落地并通过本地验证；live smoke 仍待完成。
+> 状态：Phase 0-4 的主要 runtime 路径、pipeline recovery 和发布前自动化硬化已落地；并发 vertical slice 已进入实现，仍需完成最终控制/replay、崩溃恢复、live smoke 和 release gate。
 >
-> 本计划是 [design.md](./design.md) 的执行顺序、验证门槛和回滚方案。当前 active owner 是 TypeScript extension；旧 `SKILL.md` 只作为旧版本整体回滚材料，不注册为新版本 active Skill。
-
+> 修复工作流专项计划见 [repair-workflow-plan.md](./repair-workflow-plan.md)；当前仅为提案，尚未进入 runtime 实现。
+>
 ## 1. 当前基线
 
 | 范围 | 当前状态 | 本计划处理方式 |
@@ -31,7 +31,7 @@
 - 状态查询和持久 JSONL event log 是唯一正确性来源。
 - 不在 Extension 中硬编码完整自然语言意图分类；只识别明确的 Codex/Claude 工作指令并直接转为结构化 `delegate` request，其他意图仍以结构化 tool request 为权威入口。
 - 不使用 `--last`、`--continue`、fresh agent 或随机 session 代替 exact-session recovery。
-- 不在第一阶段同时实现所有高级 pipeline 并发策略；先完成串行、可恢复的单 pipeline vertical slice。
+- 不在第一阶段实现完整 repair workflow；当前并发 vertical slice 只覆盖有界 ready-wave 调度，repair/control migration 仍按专项计划推进。
 
 ## 3. 第一条可运行 Vertical Slice
 
@@ -165,7 +165,7 @@
 - `ry-herdr-delegate/recovery.ts` 的 coordinator/pipeline recovery
 - `ry-herdr-delegate/pane-policy.ts` 的 stage disposition 集成
 
-- coordinator 从显式 `stages` 或高层 task 生成串行 stage 计划。
+- coordinator 从显式 `stages` 或高层 task 生成 stage 计划；legacy stage 保持串行，显式 ready wave 在配置和 quota 允许时可并发。
 - 每个 worker、reviewer、scout stage 创建独立 transaction/stage scope、child session 和 linked JSONL event log。
 - worker/reviewer 即使使用同一 agent kind 也不得复用 session。
 - coordinator 负责 stage wait、checkpoint、result、人工阻塞、重试、恢复和 pipeline 汇总。
@@ -179,7 +179,7 @@
 - coordinator restart、Pi restart、Herdr restart 后可从 binding、inbox 和 JSONL event log 恢复。
 - 已验证 `DONE` 的 stage 不重复执行。
 - pipeline stage pane policy 生效，coordinator pane 始终保留。
-- FIFO、默认串行、有限并发边界、人工阻塞和失败隔离均有测试。
+- FIFO、legacy 默认串行、有限 ready-wave 并发边界、人工阻塞和失败隔离均有测试。
 
 ### Phase 5：Package 硬切换与旧版本回滚材料
 

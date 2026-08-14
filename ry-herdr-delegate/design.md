@@ -36,7 +36,7 @@ runtime 进程边界固定为本项目的 `HerdrCliGateway`：它使用 `node:ch
 | 项目自有 TypeScript extension，注册 `ry_herdr_delegate_tool` | 继续以结构化 tool 作为唯一 active owner |
 | `HerdrCliGateway` 通过 `spawn` 调用 standalone `herdr` CLI | 保持 `shell: false`、显式 cwd/env、timeout/cancellation 和 JSON capability errors |
 | JSONL event log 是 runtime communication/state authority | 继续补齐通用 record recovery 和 live smoke |
-| leaf engine 与 pipeline coordinator 已覆盖基础串行路径 | 完成剩余 coordinator/recovery hardening 和发布验证 |
+| leaf engine 与 pipeline coordinator 已覆盖基础串行路径，并发 vertical slice 已开始实现 | 完成剩余 coordinator/recovery hardening、并发控制/replay 和发布验证 |
 | 旧 `SKILL.md` 未注册为 active skill，仅作 rollback material | 整体回滚到旧 package，而不是在新 runtime 中读取旧 Markdown |
 | `SKILL.md` 描述流程，模型自行调用多个 Herdr 工具 | 一个 `ry_herdr_delegate_tool` 直接执行完整 delegation 流程 |
 | 运行时依赖 `@andrewjacop/pi-herdr` 的 `herdr_delegate` | 本项目自己的 `HerdrCliGateway` 调用 `herdr` CLI |
@@ -310,7 +310,7 @@ bootstrap 中的“不递归”文字只是协作合同，不是安全边界。r
 
 coordinator 可以从高层 task 规划 stage，也可以校验请求提供的显式 stage。调度器应保证：
 
-- 同一 pipeline 的默认 stage 顺序为串行；明确标记为独立的阶段才允许有限并发；
+- 同一 pipeline 的默认 stage 顺序为串行；明确标记为独立的阶段才允许有限并发，并受 workspace reservation、lease/fence、layout/resource lock 和 quota 约束；完整 repair workflow 仍以专项计划为准。
 - worker、reviewer、scout 等每个 stage 都创建独立 child session 和 linked JSONL event log；
 - reviewer 不会因为 worker 使用了相同 agent kind 就复用 worker session；
 - stage 结果、checkpoint、阻塞和重试状态写入 JSONL event log；

@@ -414,7 +414,7 @@ export class HerdrCliGateway implements HerdrGateway {
 		if (input.cwd) args.push("--cwd", input.cwd);
 		for (const [key, value] of Object.entries(input.env ?? {})) args.push("--env", `${key}=${value}`);
 		args.push(input.focus ? "--focus" : "--no-focus");
-		return normalizePane(await this.runJson(args));
+		return normalizePane(await this.runJson(args, input.signal));
 	}
 
 	/**
@@ -423,10 +423,10 @@ export class HerdrCliGateway implements HerdrGateway {
 	 * @param target Agent name returned by the start command.
 	 * @returns The latest normalized agent snapshot, including exact session metadata when available.
 	 */
-	private async getStartedAgent(target: string): Promise<HerdrAgentSnapshot> {
+	private async getStartedAgent(target: string, signal?: AbortSignal): Promise<HerdrAgentSnapshot> {
 		let snapshot: HerdrAgentSnapshot | undefined;
 		for (let attempt = 1; attempt <= AGENT_SESSION_ATTEMPTS; attempt += 1) {
-			snapshot = await this.getAgent(target);
+			snapshot = await this.getAgent(target, signal);
 			if (snapshot.agentSession) return snapshot;
 			if (attempt === AGENT_SESSION_ATTEMPTS) break;
 			await this.debugLogger.log("herdr.agent.session.retry", {
@@ -446,7 +446,7 @@ export class HerdrCliGateway implements HerdrGateway {
 	 * @param target Agent name returned by the start command.
 	 * @returns A promise that settles after the bounded bootstrap attempt.
 	 */
-	private async bootstrapAgentSession(target: string): Promise<void> {
+	private async bootstrapAgentSession(target: string, signal?: AbortSignal): Promise<void> {
 		await this.debugLogger.log("herdr.agent.session.bootstrap.start", {
 			target,
 			timeoutMs: AGENT_SESSION_BOOTSTRAP_TIMEOUT_MS,
@@ -457,6 +457,7 @@ export class HerdrCliGateway implements HerdrGateway {
 				text: AGENT_SESSION_BOOTSTRAP_PROMPT,
 				wait: true,
 				timeoutMs: AGENT_SESSION_BOOTSTRAP_TIMEOUT_MS,
+				signal,
 			});
 			await this.debugLogger.log("herdr.agent.session.bootstrap.result", { target });
 		} catch (error) {
@@ -481,11 +482,11 @@ export class HerdrCliGateway implements HerdrGateway {
 		const args = ["agent", "start", input.name, "--kind", input.kind, "--pane", input.paneId, "--", ...input.agentArgs];
 		for (let attempt = 1; attempt <= AGENT_START_ATTEMPTS; attempt += 1) {
 			try {
-				await this.runJson(args);
-				const initial = await this.getAgent(input.name);
+				await this.runJson(args, input.signal);
+				const initial = await this.getAgent(input.name, input.signal);
 				if (initial.agentSession) return initial;
-				await this.bootstrapAgentSession(input.name);
-				return this.getStartedAgent(input.name);
+				await this.bootstrapAgentSession(input.name, input.signal);
+				return this.getStartedAgent(input.name, input.signal);
 			} catch (error) {
 				if (!isTransientAgentPaneBusy(error) || attempt === AGENT_START_ATTEMPTS) throw error;
 				await this.debugLogger.log("herdr.agent.start.retry", {
@@ -526,7 +527,7 @@ export class HerdrCliGateway implements HerdrGateway {
 				timeoutMs: input.timeoutMs,
 				fallback: "get-agent",
 			}, "warn");
-			return await this.getAgent(input.target);
+			return await this.getAgent(input.target, input.signal);
 		}
 	}
 
@@ -549,8 +550,8 @@ export class HerdrCliGateway implements HerdrGateway {
 	 * @param target Herdr agent name or target.
 	 * @returns Normalized agent snapshot.
 	 */
-	async getAgent(target: string): Promise<HerdrAgentSnapshot> {
-		return normalizeAgent(await this.runJson(["agent", "get", target]), target);
+	async getAgent(target: string, signal?: AbortSignal): Promise<HerdrAgentSnapshot> {
+		return normalizeAgent(await this.runJson(["agent", "get", target], signal), target);
 	}
 
 	/**
@@ -559,8 +560,8 @@ export class HerdrCliGateway implements HerdrGateway {
 	 * @param target Herdr agent name or target.
 	 * @returns Raw terminal output text.
 	 */
-	async readAgent(target: string): Promise<HerdrAgentOutput> {
-		const result = await this.run(["agent", "read", target, "--source", "recent-unwrapped", "--lines", "500", "--format", "text"]);
+	async readAgent(target: string, signal?: AbortSignal): Promise<HerdrAgentOutput> {
+		const result = await this.run(["agent", "read", target, "--source", "recent-unwrapped", "--lines", "500", "--format", "text"], signal);
 		const trimmed = result.stdout.trim();
 		if (!trimmed.startsWith("{")) return { text: result.stdout };
 		try {
@@ -582,7 +583,7 @@ export class HerdrCliGateway implements HerdrGateway {
 	 */
 	async createTab(input: CreateTabInput): Promise<{ tabId: string; paneId?: string }> {
 		const args = ["tab", "create", "--workspace", input.workspaceId, "--cwd", input.cwd, "--label", input.label, input.focus ? "--focus" : "--no-focus"];
-		const raw = unwrapResult(await this.runJson(args));
+		const raw = unwrapResult(await this.runJson(args, input.signal));
 		const record = asRecord(raw);
 		if (!record) throw new HerdrCapabilityError("Herdr tab response is not an object", args);
 		const tabRecord = asRecord(record.tab);
@@ -605,7 +606,7 @@ export class HerdrCliGateway implements HerdrGateway {
 		if (input.tabLabel) args.push(input.newTab ? "--label" : "--tab-label", input.tabLabel);
 		if (input.workspaceId) args.push("--workspace", input.workspaceId);
 		args.push(input.focus ? "--focus" : "--no-focus");
-		const raw = unwrapResult(await this.runJson(args));
+		const raw = unwrapResult(await this.runJson(args, input.signal));
 		const record = asRecord(raw);
 		const tab = asRecord(record?.tab);
 		return { tabId: typeof tab?.tab_id === "string" ? tab.tab_id : typeof record?.tab_id === "string" ? record.tab_id : undefined };
@@ -617,8 +618,8 @@ export class HerdrCliGateway implements HerdrGateway {
 	 * @param paneId Pane identifier to close.
 	 * @returns A promise resolved after Herdr confirms the close.
 	 */
-	async closePane(paneId: string): Promise<void> {
-		await this.runJson(["pane", "close", paneId]);
+	async closePane(paneId: string, signal?: AbortSignal): Promise<void> {
+		await this.runJson(["pane", "close", paneId], signal);
 	}
 
 	/**
@@ -626,7 +627,7 @@ export class HerdrCliGateway implements HerdrGateway {
 	 *
 	 * @returns Raw snapshot plus normalized agent entries.
 	 */
-	async snapshot(): Promise<HerdrSnapshot> {
-		return this.snapshotRaw();
+	async snapshot(signal?: AbortSignal): Promise<HerdrSnapshot> {
+		return this.snapshotRaw(signal);
 	}
 }

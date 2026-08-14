@@ -1,6 +1,6 @@
 {
   "name": "ry-skill",
-  "version": "0.5.21",
+  "version": "0.5.22",
   "description": "Custom Pi skills and extensions for fast Herdr workflows.",
   "type": "module",
   "license": "MIT",
@@ -39,6 +39,7 @@
     "ry-herdr-delegate/pipeline.ts",
     "ry-herdr-delegate/pipeline-coordinator.ts",
     "ry-herdr-delegate/coordinator-store.ts",
+    "ry-herdr-delegate/concurrency.ts",
     "ry-herdr-delegate/herdr/**/*.ts",
     "ry-herdr-delegate/SKILL.md",
     "ry-herdr-delegate/config.example.json",

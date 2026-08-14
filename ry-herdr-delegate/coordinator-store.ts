@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 
 import lockfile from "proper-lockfile";
 
-import type { AgentTransportStatus, CoordinatorBinding } from "./types.ts";
+import type { ActivePipelineReservation, AgentTransportStatus, CoordinatorBinding } from "./types.ts";
 
 /** Binding persistence options shared by coordinator creation and recovery. */
 export interface CoordinatorStoreOptions {
@@ -26,8 +26,14 @@ export class CoordinatorStore {
 	readonly bindingPath: string;
 	/** Durable inbox JSONL path. */
 	readonly inboxPath: string;
-	/** Sidecar path used to serialize coordinator ticks. */
+	/** Sidecar path used to serialize short coordinator claim/commit sections. */
 	readonly executionLockPath: string;
+	/** Workspace-scoped reservation ledger JSONL path. */
+	readonly reservationLedgerPath: string;
+	/** Sidecar lock serializing pane layout mutations. */
+	readonly layoutLockPath: string;
+	/** Sidecar lock serializing shared resource claims. */
+	readonly resourceLockPath: string;
 	/** Lock configuration. */
 	private readonly options: CoordinatorStoreOptions;
 
@@ -46,6 +52,9 @@ export class CoordinatorStore {
 		this.bindingPath = join(this.stateDirectory, "pipeline-coordinator.json");
 		this.inboxPath = join(this.stateDirectory, "pipelines", "inbox.jsonl");
 		this.executionLockPath = join(this.stateDirectory, "pipeline-coordinator.tick.lock");
+		this.reservationLedgerPath = join(this.stateDirectory, "reservations.jsonl");
+		this.layoutLockPath = join(this.stateDirectory, "workspace-layout.lock");
+		this.resourceLockPath = join(this.stateDirectory, "workspace-resources.lock");
 		this.options = options;
 	}
 
@@ -56,6 +65,9 @@ export class CoordinatorStore {
 		await ensureEmptyFile(this.bindingPath);
 		await ensureEmptyFile(this.inboxPath);
 		await ensureEmptyFile(this.executionLockPath);
+		await ensureEmptyFile(this.reservationLedgerPath);
+		await ensureEmptyFile(this.layoutLockPath);
+		await ensureEmptyFile(this.resourceLockPath);
 	}
 
 	/** Reads and validates the current binding, returning undefined for an unbound project. */
@@ -116,6 +128,27 @@ export class CoordinatorStore {
 		}
 	}
 
+	/** Runs a callback while holding the workspace pane-layout lock. */
+	async withLayoutLock<T>(callback: () => Promise<T>): Promise<T> {
+		return this.withPathLock(this.layoutLockPath, callback);
+	}
+
+	/** Runs a callback while holding the shared resource lock. */
+	async withResourceLock<T>(callback: () => Promise<T>): Promise<T> {
+		return this.withPathLock(this.resourceLockPath, callback);
+	}
+
+	/** Applies the common filesystem sidecar-lock policy to one workspace lock. */
+	private async withPathLock<T>(path: string, callback: () => Promise<T>): Promise<T> {
+		await this.ensure();
+		const release = await lockfile.lock(path, {
+			realpath: false,
+			stale: Math.max(this.options.staleMs ?? 10000, 2000),
+			retries: { retries: this.options.retries ?? 20, minTimeout: 10, maxTimeout: 250, factor: 1.5 },
+		});
+		try { return await callback(); } finally { await release(); }
+	}
+
 	/** Publishes one fully verified binding through atomic rename and read-after-write validation. */
 	async write(binding: CoordinatorBinding): Promise<CoordinatorBinding> {
 		validateBinding(binding, this.projectRoot, this.workspaceId, this.bindingPath);
@@ -135,12 +168,27 @@ export class CoordinatorStore {
 		return written;
 	}
 
+	/** Updates the replay-derived reservation projection while preserving the coordinator writer fence.
+	 *
+	 * @param reservations Current active, intent, or orphan-pending leases.
+	 * @param writerFence Expected coordinator writer fence.
+	 * @returns The updated binding, or undefined when no binding exists.
+	 */
+	async updateReservations(reservations: readonly ActivePipelineReservation[], writerFence?: string): Promise<CoordinatorBinding | undefined> {
+		return this.withLock(async () => {
+			const current = await this.read();
+			if (!current) return undefined;
+			if (writerFence !== undefined && current.writerFence !== writerFence) throw new Error("Coordinator reservation projection writer fence is stale");
+			return this.write({ ...current, activePipelineReservations: reservations, lastSeenAt: new Date().toISOString() });
+		});
+	}
 	/** Updates transport metadata while the caller already owns the binding lock. */
 	async updateStatus(status: AgentTransportStatus, paneId: string, lastSeenAt = new Date().toISOString()): Promise<CoordinatorBinding | undefined> {
 		const current = await this.read();
 		if (!current) return undefined;
 		return this.write({ ...current, status, paneId, lastSeenAt });
 	}
+
 }
 
 /** Ensures a file exists so proper-lockfile can create its sidecar directory. */
@@ -168,7 +216,7 @@ function workspaceDirectoryName(workspaceId: string): string {
 function validateBinding(value: unknown, projectRoot: string, workspaceId: string, source: string): CoordinatorBinding {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Coordinator binding must be an object: ${source}`);
 	const input = value as Record<string, unknown>;
-	if (input.schemaVersion !== 1) throw new Error(`Coordinator binding schemaVersion must be 1: ${source}`);
+	if (input.schemaVersion !== 1 && input.schemaVersion !== 2) throw new Error(`Coordinator binding schemaVersion must be 1 or 2: ${source}`);
 	for (const [key, expected] of [["projectRoot", projectRoot], ["workspaceId", workspaceId]] as const) {
 		if (input[key] !== expected) throw new Error(`Coordinator binding ${key} does not match current context: ${source}`);
 	}
@@ -186,5 +234,8 @@ function validateBinding(value: unknown, projectRoot: string, workspaceId: strin
 	for (const key of ["kind", "source", "value"]) {
 		if (typeof sessionRecord[key] !== "string" || sessionRecord[key].length === 0) throw new Error(`Coordinator binding agentSession.${key} is invalid: ${source}`);
 	}
+	const reservations = input.activePipelineReservations;
+	if (reservations !== undefined && (!Array.isArray(reservations) || reservations.some((item) => !item || typeof item !== "object" || typeof (item as Record<string, unknown>).reservationId !== "string" || typeof (item as Record<string, unknown>).pipelineId !== "string" || !Number.isSafeInteger((item as Record<string, unknown>).reservedSlots) || !Array.isArray((item as Record<string, unknown>).leaseIds) || !Number.isSafeInteger((item as Record<string, unknown>).reservationEpoch) || typeof (item as Record<string, unknown>).ownerEpoch !== "string"))) throw new Error(`Coordinator binding activePipelineReservations is invalid: ${source}`);
+	if (input.schemaVersion === 2 && (typeof input.schemaEpoch !== "number" || !Number.isSafeInteger(input.schemaEpoch) || input.schemaEpoch < 1 || typeof input.writerFence !== "string" || input.writerFence.length === 0)) throw new Error(`Coordinator binding schemaVersion 2 requires schemaEpoch and writerFence: ${source}`);
 	return input as unknown as CoordinatorBinding;
 }

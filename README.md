@@ -56,7 +56,7 @@ rollback material and is not registered as an active Pi skill.
 | --- | --- |
 | Leaf delegation | Creates a JSONL event log, resolves profile arguments, starts one child pane through `HerdrCliGateway`, waits, validates the completion contract, and applies `close`, `keep`, or `new-tab` only after semantic `DONE`. |
 | Pipeline submission | Persists a complete request and FIFO inbox entry, then returns `QUEUED` or bounded-ack `ACCEPTED` without waiting for stage completion. |
-| Coordinator | Uses one project/workspace-bound long-lived Pi pane, exact session binding, serial stage ticks, stage-specific JSONL logs, answer/stop controls, and closed-pane exact-session recovery. |
+| Coordinator | Uses one project/workspace-bound long-lived Pi pane, exact session binding, bounded ready-wave stage ticks, workspace reservations/leases/fences/layout locks, stage-specific JSONL logs, answer/stop controls, and closed-pane exact-session recovery. Legacy stages remain serial. |
 | Communication | JSONL/NDJSON is the sole runtime source of truth. Child agents read relay-designated events; the parent/coordinator owns validation and writes. No Codex/Claude communication plugin is required. |
 | Herdr boundary | All delegate side effects pass through `HerdrCliGateway`, which uses argv arrays, explicit `cwd`/environment, cancellation/timeout, and captured stdout/stderr. |
 | Recovery | Open-pane reuse and definitively closed-pane resume require the complete `agent_session` identity. Unknown or mismatched state returns `BLOCKED` or `PARTIAL`; generic latest-session fallback is not used. |
@@ -186,10 +186,11 @@ npm pack --dry-run
 ```
 
 The current fake/integration coverage includes JSONL replay, exact-session
-identity, leaf pane policy, coordinator queue/tick behavior, accepted receipts,
-answer/stop controls, closed-pane exact-session recovery, workspace isolation,
-path-safety checks, and coordinator bootstrap races. Live smoke against an
-authenticated Herdr workspace remains explicit validation work.
+identity, leaf pane policy, coordinator queue/tick behavior, bounded concurrent
+ready waves, reservation expiry/reconciliation, accepted receipts, answer/stop
+controls, closed-pane exact-session recovery, workspace isolation, path-safety
+checks, and coordinator bootstrap races. Live smoke against an authenticated
+Herdr workspace remains explicit validation work.
 
 ## License
 

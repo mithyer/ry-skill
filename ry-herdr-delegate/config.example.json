@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "defaults": {
     "timeoutMs": 180000,
     "panePolicy": "new-tab",
@@ -71,7 +71,21 @@
   },
   "pipelines": {
     "default": {
-      "maxStages": 8
+      "maxStages": 8,
+      "concurrency": {
+        "enabled": true,
+        "maxAgents": 3,
+        "maxPipelines": 1,
+        "maxConcurrentStages": 3,
+        "leaseTtlMs": 600000,
+        "startupGraceMs": 30000,
+        "captureGraceMs": 10000,
+        "controlMarginMs": 30000,
+        "heartbeatMs": 10000,
+        "controlPollMs": 1000,
+        "failFast": false,
+        "unknownResourcePolicy": "block"
+      }
     }
   }
 }

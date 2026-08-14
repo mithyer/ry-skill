@@ -138,7 +138,18 @@ test("HerdrCliGateway uses the validated spawn boundary", async () => {
 	assert.deepEqual(moveCall.args, ["pane", "move", "w-test:p2", "--new-tab", "--label", "closed-pane-test", "--workspace", "w-test", "--no-focus"]);
 });
 
-/** Treats Herdr's idle-state prompt stall as a completed fast turn without resending the relay. */
+/** Verifies cancellation reaches every Herdr lifecycle subprocess used by a leaf stage. */
+test("HerdrCliGateway forwards AbortSignal across lifecycle commands", async () => {
+	const calls: SpawnCall[] = [];
+	const controller = new AbortController();
+	const gateway = makeGateway(calls);
+	await gateway.splitPane({ sourcePaneId: "w-test:p1", signal: controller.signal });
+	await gateway.startAgent({ name: "worker-signal", kind: "pi", paneId: "w-test:p2", agentArgs: ["--yolo"], signal: controller.signal });
+	await gateway.readAgent("worker-signal", controller.signal);
+	await gateway.movePane({ paneId: "w-test:p2", newTab: true, tabLabel: "signal-pane", signal: controller.signal });
+	await gateway.closePane("w-test:p2", controller.signal);
+	for (const call of calls) assert.ok(call.options.signal instanceof AbortSignal, `${call.args[0]} ${call.args[1]} did not receive a cancellable signal`);
+});
 test("HerdrCliGateway recovers agent_prompt_stalled from current agent metadata", async () => {
 	const calls: SpawnCall[] = [];
 	const spawnProcess: SpawnProcess = (command, args, options) => {

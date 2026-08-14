@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 import type {
 	AgentToolResult,
@@ -20,15 +21,17 @@ import { DelegateEngine } from "./engine.ts";
 import { parseDelegateConfig } from "./config.ts";
 import { HerdrCliGateway } from "./herdr/client.ts";
 import { PipelineCoordinator } from "./pipeline-coordinator.ts";
+import { canonicalCwdResourceKey, WorkspaceReservationLedger } from "./concurrency.ts";
 import { PipelineStore, type PipelineProgress } from "./pipeline.ts";
 import type { DelegateResult, PipelineControlResult, PipelineSubmission, SessionIdentity } from "./types.ts";
 
 /** Structured action names exposed by the project-owned runtime. */
-const ACTIONS = ["delegate", "pipeline", "pipeline.status", "pipeline.answer", "pipeline.stop", "pipeline.coordinator", "recover"] as const;
+const ACTIONS = ["delegate", "pipeline", "pipeline.status", "pipeline.answer", "pipeline.approve", "pipeline.reject", "pipeline.stop", "pipeline.coordinator", "recover", "pipeline.recover"] as const;
 
 /** TypeBox schema for the high-level delegate tool. */
 const panePolicy = Type.Optional(Type.Union([Type.Literal("close"), Type.Literal("keep"), Type.Literal("new-tab")]));
 const pipelineStage = Type.Object({
+	stageId: Type.Optional(Type.String({ minLength: 1, pattern: "^[A-Za-z][A-Za-z0-9_-]{0,127}$" })),
 	role: Type.String({ minLength: 1 }),
 	task: Type.Optional(Type.String({ minLength: 1 })),
 	agent: Type.Optional(Type.Union([Type.Literal("codex"), Type.Literal("claude"), Type.Literal("pi")])),
@@ -37,6 +40,11 @@ const pipelineStage = Type.Object({
 	cwd: Type.Optional(Type.String({ minLength: 1 })),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
 	panePolicy,
+	dependsOn: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+	access: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("workspace-write"), Type.Literal("external-side-effect")])),
+	resourceKeys: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+	failFast: Type.Optional(Type.Boolean()),
+	maxConcurrentStages: Type.Optional(Type.Integer({ minimum: 1 })),
 });
 export const DelegateToolParameters = Type.Object({
 	action: Type.Union(ACTIONS.map((action) => Type.Literal(action))),
@@ -48,8 +56,15 @@ export const DelegateToolParameters = Type.Object({
 	cwd: Type.Optional(Type.String({ minLength: 1 })),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
 	panePolicy,
+	access: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("workspace-write"), Type.Literal("external-side-effect")])),
+	resourceKeys: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
 	stages: Type.Optional(Type.Array(pipelineStage, { maxItems: 12 })),
 	pipelineId: Type.Optional(Type.String({ minLength: 1 })),
+	targetStageId: Type.Optional(Type.String({ minLength: 1 })),
+	stageOccurrence: Type.Optional(Type.Integer({ minimum: 1 })),
+	expectedAttempt: Type.Optional(Type.Integer({ minimum: 1 })),
+	expectedFence: Type.Optional(Type.String({ minLength: 1 })),
+	planHash: Type.Optional(Type.String({ minLength: 1 })),
 	answer: Type.Optional(Type.String()),
 });
 
@@ -230,11 +245,11 @@ function createPipelineCoordinator(ctx: ExtensionContext, config: ReturnType<typ
 	});
 }
 
-/** Footer key used by the parent Pi session for one active pipeline monitor. */
-const PIPELINE_UI_STATUS_KEY = "ry-herdr-delegate";
+/** Prefix used to namespace parent-session-owned pipeline status surfaces. */
+const PIPELINE_UI_STATUS_PREFIX = "ry-herdr-delegate";
 
-/** Widget key used by the parent Pi session for detailed pipeline stage progress. */
-const PIPELINE_UI_WIDGET_KEY = "ry-herdr-delegate-pipeline";
+/** Prefix used to namespace parent-session-owned pipeline widgets. */
+const PIPELINE_UI_WIDGET_PREFIX = "ry-herdr-delegate-pipeline";
 
 /** Poll interval for replaying durable pipeline progress into the parent UI. */
 const PIPELINE_UI_POLL_MS = 1000;
@@ -257,11 +272,16 @@ export function formatPipelineUi(progress: Pick<PipelineProgress, "state" | "sta
 	return lines;
 }
 
+/** Returns a stable private UI surface key for one parent session and pipeline. */
+function pipelineUiSurfaceKey(ctx: ExtensionContext, pipelineId: string, prefix: string): string {
+	return `${prefix}:${ctx.sessionManager.getSessionFile() ?? "ephemeral"}:${pipelineId}`;
+}
+
 /** Pushes one replayed pipeline snapshot into Pi's footer and widget surfaces. */
 function renderPipelineUi(ctx: ExtensionContext, progress: PipelineProgress): void {
 	const status = progress.state.status;
-	ctx.ui.setStatus(PIPELINE_UI_STATUS_KEY, `pipeline ${progress.state.pipelineId} · ${status}`);
-	ctx.ui.setWidget(PIPELINE_UI_WIDGET_KEY, formatPipelineUi(progress));
+	ctx.ui.setStatus(pipelineUiSurfaceKey(ctx, progress.state.pipelineId, PIPELINE_UI_STATUS_PREFIX), `pipeline ${progress.state.pipelineId} · ${status}`);
+	ctx.ui.setWidget(pipelineUiSurfaceKey(ctx, progress.state.pipelineId, PIPELINE_UI_WIDGET_PREFIX), formatPipelineUi(progress));
 }
 
 /** Builds a stable monitor key that prevents duplicate timers for one parent pipeline. */
@@ -294,8 +314,11 @@ function startPipelineUiMonitor(ctx: ExtensionContext, config: ReturnType<typeof
 			renderPipelineUi(ctx, progress);
 			if (TERMINAL_PIPELINE_STATUSES.has(progress.state.status)) stopPipelineUiMonitor(key);
 		} catch (error) {
-			ctx.ui.setStatus(PIPELINE_UI_STATUS_KEY, `pipeline ${pipelineId} · ERROR`);
-			ctx.ui.setWidget(PIPELINE_UI_WIDGET_KEY, [`Herdr pipeline ${pipelineId} · ERROR`, error instanceof Error ? error.message : String(error)]);
+			const statusKey = pipelineUiSurfaceKey(ctx, pipelineId, PIPELINE_UI_STATUS_PREFIX);
+			const widgetKey = pipelineUiSurfaceKey(ctx, pipelineId, PIPELINE_UI_WIDGET_PREFIX);
+			ctx.ui.setStatus(statusKey, `pipeline ${pipelineId} · ERROR`);
+			ctx.ui.setWidget(widgetKey, [`Herdr pipeline ${pipelineId} · ERROR`, "Unable to read durable pipeline progress"]);
+			await debug.log("pipeline.ui.monitor-error", { pipelineId, error: debugError(error) }, "warn");
 			stopPipelineUiMonitor(key);
 		} finally {
 			monitor.polling = false;
@@ -442,6 +465,46 @@ export function createAutomaticDelegateInputHandler(executor: DelegateExecutor =
 	};
 }
 
+/** Resolves a direct leaf cwd under the current project root. */
+async function resolveDirectCwd(projectRoot: string, cwd: string): Promise<string> {
+	const projectKey = await canonicalCwdResourceKey(projectRoot);
+	const candidateKey = await canonicalCwdResourceKey(resolve(projectRoot, cwd));
+	if (!projectKey || !candidateKey) throw new Error("delegate cwd cannot be canonicalized");
+	const projectPath = projectKey.slice("cwd:".length);
+	const candidatePath = candidateKey.slice("cwd:".length);
+	const pathFromProject = relative(projectPath, candidatePath);
+	if (pathFromProject === ".." || pathFromProject.startsWith(`..${process.platform === "win32" ? "\\\\" : "/"}`) || pathFromProject.startsWith("/")) throw new Error("delegate cwd must remain inside the project root");
+	return candidatePath;
+}
+
+/** Resolves direct-leaf resource declarations to canonical workspace keys. */
+async function resolveDirectResourceKeys(projectRoot: string, cwd: string, declared: readonly string[] | undefined): Promise<readonly string[]> {
+	if (!declared || declared.length === 0) {
+		const defaultKey = await canonicalCwdResourceKey(cwd);
+		return defaultKey ? [defaultKey] : [];
+	}
+	const projectKey = await canonicalCwdResourceKey(projectRoot);
+	if (!projectKey) throw new Error("delegate project root resource cannot be canonicalized");
+	const projectPath = projectKey.slice("cwd:".length);
+	const result: string[] = [];
+	for (const raw of declared) {
+		const key = raw.trim();
+		if (!key) continue;
+		if (key.startsWith("cwd:")) {
+			const canonical = await canonicalCwdResourceKey(key.slice("cwd:".length));
+			if (!canonical || canonical !== `cwd:${key.slice("cwd:".length)}`) throw new Error(`delegate cwd resource key is not canonical: ${key}`);
+			const resourcePath = canonical.slice("cwd:".length);
+			const relativeResource = relative(projectPath, resourcePath);
+			if (relativeResource === ".." || relativeResource.startsWith(`..${process.platform === "win32" ? "\\\\" : "/"}`) || relativeResource.startsWith("/")) throw new Error(`delegate cwd resource key is outside the project root: ${key}`);
+			result.push(canonical);
+			continue;
+		}
+		if (!/^[A-Za-z][A-Za-z0-9_-]*:[^\s]+$/.test(key)) throw new Error(`delegate resource key must be namespaced: ${key}`);
+		result.push(key);
+	}
+	return [...new Set(result)];
+}
+
 /** Executes one request after configuration and the request-scoped logger are initialized. */
 async function executeDelegateToolWithConfig(
 	params: DelegateToolParams,
@@ -487,8 +550,26 @@ async function executeDelegateToolWithConfig(
 		const workspaceId = process.env.HERDR_WORKSPACE_ID;
 		if (!workspaceId) return toolResult({ status: "BLOCKED", error: "Current Pi context has no Herdr workspace" }, true);
 		try {
-			const control = await createPipelineCoordinator(ctx, config, workspaceId).answer(params.pipelineId, params.answer, ctx.cwd, workspaceId, signal);
+			const coordinator = createPipelineCoordinator(ctx, config, workspaceId);
+			const target = params.targetStageId ? { stageId: params.targetStageId, stageOccurrence: params.stageOccurrence, expectedAttempt: params.expectedAttempt, expectedFence: params.expectedFence } : undefined;
+			const control = await coordinator.answer(params.pipelineId, params.answer, ctx.cwd, workspaceId, signal, target);
 			return toolResult({ status: control.status, control, communicationFile: control.communicationFile }, control.status === "ERROR");
+		} catch (error) {
+			return toolResult({ status: "ERROR", error: error instanceof Error ? error.message : String(error) }, true);
+		}
+	}
+	if (params.action === "pipeline.approve" || params.action === "pipeline.reject") {
+		if (!params.pipelineId) return toolResult({ status: "ERROR", error: `${params.action} requires pipelineId` }, true);
+		if (!params.targetStageId) return toolResult({ status: "BLOCKED", error: `${params.action} requires targetStageId` }, true);
+		const workspaceId = process.env.HERDR_WORKSPACE_ID;
+		if (!workspaceId) return toolResult({ status: "BLOCKED", error: "Current Pi context has no Herdr workspace" }, true);
+		try {
+			const coordinator = createPipelineCoordinator(ctx, config, workspaceId);
+			const target = { stageId: params.targetStageId, stageOccurrence: params.stageOccurrence, expectedAttempt: params.expectedAttempt, expectedFence: params.expectedFence };
+			const control = params.action === "pipeline.approve"
+				? await coordinator.approve(params.pipelineId, ctx.cwd, workspaceId, target, params.planHash, signal)
+				: await coordinator.reject(params.pipelineId, ctx.cwd, workspaceId, target, params.planHash, signal);
+			return toolResult({ status: control.status, control, communicationFile: control.communicationFile }, ["ERROR", "BLOCKED"].includes(control.status));
 		} catch (error) {
 			return toolResult({ status: "ERROR", error: error instanceof Error ? error.message : String(error) }, true);
 		}
@@ -516,13 +597,14 @@ async function executeDelegateToolWithConfig(
 			return toolResult({ status: "BLOCKED", error: error instanceof Error ? error.message : String(error) }, true);
 		}
 	}
-	if (params.action === "recover") {
-		if (!params.pipelineId) return toolResult({ status: "ERROR", error: "recover requires pipelineId" }, true);
+	if (params.action === "recover" || params.action === "pipeline.recover") {
+		if (!params.pipelineId) return toolResult({ status: "ERROR", error: `${params.action} requires pipelineId` }, true);
 		const workspaceId = process.env.HERDR_WORKSPACE_ID;
 		const sourcePaneId = process.env.HERDR_PANE_ID;
 		if (!workspaceId || !sourcePaneId) return toolResult({ status: "BLOCKED", error: "Pi is not running inside a Herdr-managed pane" }, true);
 		try {
-			const control = await createPipelineCoordinator(ctx, config, workspaceId).recover(params.pipelineId, ctx.cwd, workspaceId, sourcePaneId, ctx.cwd, signal);
+			const target = params.targetStageId ? { stageId: params.targetStageId, stageOccurrence: params.stageOccurrence, expectedAttempt: params.expectedAttempt, expectedFence: params.expectedFence } : undefined;
+			const control = await createPipelineCoordinator(ctx, config, workspaceId).recover(params.pipelineId, ctx.cwd, workspaceId, sourcePaneId, ctx.cwd, signal, target);
 			return toolResult({ status: control.status, control, communicationFile: control.communicationFile }, ["ERROR", "BLOCKED", "PARTIAL"].includes(control.status));
 		} catch (error) {
 			return toolResult({ status: "ERROR", error: error instanceof Error ? error.message : String(error) }, true);
@@ -532,17 +614,37 @@ async function executeDelegateToolWithConfig(
 	if (!params.task) return toolResult({ status: "ERROR", error: "delegate requires task" }, true);
 	if (ctx.mode !== "tui") return toolResult({ status: "BLOCKED", error: "delegate requires a Pi TUI context with a Herdr pane" }, true);
 	const gateway = new HerdrCliGateway({ cwd: ctx.cwd });
-	const engine = new DelegateEngine({
-		gateway,
-		config,
-		capabilities: { childEnvVerified: false },
-	});
 	const workspaceId = process.env.HERDR_WORKSPACE_ID;
 	const sourcePaneId = process.env.HERDR_PANE_ID;
 	if (!workspaceId || !sourcePaneId) {
 		return toolResult({ status: "BLOCKED", error: "Pi is not running inside a Herdr-managed pane" }, true);
 	}
-	const result = await engine.run({
+	const directStore = new PipelineStore(ctx.cwd, workspaceId);
+	const engine = new DelegateEngine({
+		gateway,
+		config,
+		communicationDirectory: join(directStore.coordinatorStore.stateDirectory, "communications"),
+		capabilities: { childEnvVerified: false },
+	});
+	const directLedger = new WorkspaceReservationLedger(ctx.cwd, workspaceId, { leaseTtlMs: config.pipelines.default.concurrency.leaseTtlMs });
+	const effectiveCwd = await resolveDirectCwd(ctx.cwd, params.cwd ?? ctx.cwd);
+	const resourceKeys = await resolveDirectResourceKeys(ctx.cwd, effectiveCwd, params.resourceKeys);
+	if (resourceKeys.length === 0) return toolResult({ status: "BLOCKED", error: "delegate resource ownership cannot be proven" }, true);
+	const directReservationId = `direct-${workspaceId}-${randomUUID()}`;
+	const directOwnerEpoch = currentPiSession(ctx)?.value ?? `process:${process.pid}`;
+	const directReservation = await directLedger.claim({
+		reservationId: directReservationId,
+		pipelineId: directReservationId,
+		reservedSlots: 0,
+		access: params.access ?? "workspace-write",
+		resourceKeys,
+		ownerEpoch: directOwnerEpoch,
+		expiresAt: new Date(Date.now() + config.pipelines.default.concurrency.leaseTtlMs).toISOString(),
+	});
+	if (!directReservation.committed) return toolResult({ status: "BLOCKED", error: directReservation.reason === "resource-conflict" ? "delegate resource is already reserved" : "delegate resource reservation failed" }, true);
+	let result: DelegateResult;
+	try {
+		result = await engine.run({
 		action: "delegate",
 		task: params.task,
 		role: params.role ?? "delegate",
@@ -550,15 +652,23 @@ async function executeDelegateToolWithConfig(
 			agent: params.agent,
 			effort: params.effort,
 			extraArgs: params.extraArgs,
-			cwd: params.cwd,
+			cwd: effectiveCwd,
 			timeoutMs: params.timeoutMs,
 			panePolicy: params.panePolicy,
 		},
+		resourceKeys,
+		access: params.access ?? "workspace-write",
 	}, {
-		cwd: params.cwd ?? ctx.cwd,
+		cwd: effectiveCwd,
 		workspaceId,
 		sourcePaneId,
+		layoutLock: (callback) => directStore.coordinatorStore.withLayoutLock(callback),
+		resourceKeys,
+		access: params.access ?? "workspace-write",
 	}, signal);
+	} finally {
+		await directLedger.release(directReservationId, directOwnerEpoch).catch(() => undefined);
+	}
 	return toolResult({ status: result.status, result, communicationFile: result.communicationFile }, result.status === "ERROR");
 }
 

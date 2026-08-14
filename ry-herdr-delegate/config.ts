@@ -5,6 +5,7 @@ import type {
 	DelegateConfig,
 	DelegateOverrides,
 	ResolvedAgentProfile,
+	ConcurrencyConfig,
 	RoleConfig,
 } from "./types.ts";
 
@@ -71,6 +72,22 @@ const AGENT_KINDS = new Set<AgentKind>(["codex", "claude", "pi"]);
 
 /** Supported role names accepted by the structured delegate tool. */
 const SUPPORTED_ROLES = new Set(["scout", "researcher", "worker", "reviewer", "oracle", "delegate"]);
+
+/** Version-2 concurrency defaults used for v1 in-memory migration. */
+const DEFAULT_CONCURRENCY: ConcurrencyConfig = {
+	enabled: true,
+	maxAgents: 3,
+	maxPipelines: 1,
+	maxConcurrentStages: 3,
+	leaseTtlMs: 600_000,
+	startupGraceMs: 30_000,
+	captureGraceMs: 10_000,
+	controlMarginMs: 30_000,
+	heartbeatMs: 10_000,
+	controlPollMs: 1_000,
+	failFast: false,
+	unknownResourcePolicy: "block",
+};
 
 /** Checks whether a pipeline stage role resolves to a supported built-in or configured role.
  *
@@ -147,6 +164,43 @@ function readPositiveInteger(value: unknown, path: string, fallback: number): nu
 	return value;
 }
 
+/** Validates a strict boolean policy value. */
+function readBoolean(value: unknown, path: string, fallback: boolean): boolean {
+	if (value === undefined) return fallback;
+	if (typeof value !== "boolean") throw configError(path, "must be a boolean");
+	return value;
+}
+
+/** Parses and cross-validates the bounded coordinator concurrency policy. */
+function parseConcurrency(value: unknown, path: string): ConcurrencyConfig {
+	const input = asRecord(value ?? {}, path);
+	rejectUnknownKeys(input, [
+		"enabled", "maxAgents", "maxPipelines", "maxConcurrentStages", "leaseTtlMs",
+		"startupGraceMs", "captureGraceMs", "controlMarginMs", "heartbeatMs", "controlPollMs",
+		"failFast", "unknownResourcePolicy",
+	], path);
+	const concurrency: ConcurrencyConfig = {
+		enabled: readBoolean(input.enabled, `${path}.enabled`, DEFAULT_CONCURRENCY.enabled),
+		maxAgents: readPositiveInteger(input.maxAgents, `${path}.maxAgents`, DEFAULT_CONCURRENCY.maxAgents),
+		maxPipelines: readPositiveInteger(input.maxPipelines, `${path}.maxPipelines`, DEFAULT_CONCURRENCY.maxPipelines),
+		maxConcurrentStages: readPositiveInteger(input.maxConcurrentStages, `${path}.maxConcurrentStages`, DEFAULT_CONCURRENCY.maxConcurrentStages),
+		leaseTtlMs: readPositiveInteger(input.leaseTtlMs, `${path}.leaseTtlMs`, DEFAULT_CONCURRENCY.leaseTtlMs),
+		startupGraceMs: readPositiveInteger(input.startupGraceMs, `${path}.startupGraceMs`, DEFAULT_CONCURRENCY.startupGraceMs),
+		captureGraceMs: readPositiveInteger(input.captureGraceMs, `${path}.captureGraceMs`, DEFAULT_CONCURRENCY.captureGraceMs),
+		controlMarginMs: readPositiveInteger(input.controlMarginMs, `${path}.controlMarginMs`, DEFAULT_CONCURRENCY.controlMarginMs),
+		heartbeatMs: readPositiveInteger(input.heartbeatMs, `${path}.heartbeatMs`, DEFAULT_CONCURRENCY.heartbeatMs),
+		controlPollMs: readPositiveInteger(input.controlPollMs, `${path}.controlPollMs`, DEFAULT_CONCURRENCY.controlPollMs),
+		failFast: readBoolean(input.failFast, `${path}.failFast`, DEFAULT_CONCURRENCY.failFast),
+		unknownResourcePolicy: input.unknownResourcePolicy === undefined ? DEFAULT_CONCURRENCY.unknownResourcePolicy : input.unknownResourcePolicy === "block" ? "block" : (() => { throw configError(`${path}.unknownResourcePolicy`, "must be block"); })(),
+	};
+	if (concurrency.maxConcurrentStages > concurrency.maxAgents) throw configError(`${path}.maxConcurrentStages`, "must be no greater than maxAgents");
+	if (concurrency.leaseTtlMs <= concurrency.startupGraceMs + concurrency.captureGraceMs + concurrency.controlMarginMs) {
+		throw configError(`${path}.leaseTtlMs`, "must exceed startupGraceMs + captureGraceMs + controlMarginMs");
+	}
+	if (concurrency.heartbeatMs >= concurrency.leaseTtlMs / 2) throw configError(`${path}.heartbeatMs`, "must be less than half of leaseTtlMs");
+	return concurrency;
+}
+
 /** Validates a supported agent kind. */
 function readAgentKind(value: unknown, path: string, fallback: AgentKind): AgentKind {
 	if (value === undefined) return fallback;
@@ -216,11 +270,14 @@ export function parseDelegateConfig(value: unknown): DelegateConfig {
 	for (const roleName of Object.keys(rolesInput)) {
 		if (!SUPPORTED_ROLES.has(roleName)) throw configError(`roles.${roleName}`, "unknown role");
 	}
+	const inputVersion = input.version === undefined ? 1 : input.version;
+	if (inputVersion !== 1 && inputVersion !== 2) throw configError("version", "must be 1 or 2");
 	const pipelinesInput = asRecord(input.pipelines ?? {}, "pipelines");
 	rejectUnknownKeys(pipelinesInput, ["default"], "pipelines");
 	const pipelineDefaultInput = asRecord(pipelinesInput.default ?? {}, "pipelines.default");
-	rejectUnknownKeys(pipelineDefaultInput, ["maxStages"], "pipelines.default");
+	rejectUnknownKeys(pipelineDefaultInput, ["maxStages", "concurrency"], "pipelines.default");
 	const maxStages = readPositiveInteger(pipelineDefaultInput.maxStages, "pipelines.default.maxStages", 8);
+	const concurrency = parseConcurrency(pipelineDefaultInput.concurrency, "pipelines.default.concurrency");
 	if (maxStages > 12) throw configError("pipelines.default.maxStages", "must be no greater than 12");
 	const agents = {} as Record<AgentKind, AgentProfileConfig>;
 	for (const kind of ["codex", "claude", "pi"] as const) {
@@ -231,7 +288,8 @@ export function parseDelegateConfig(value: unknown): DelegateConfig {
 		roles[role] = parseRole(roleValue, `roles.${role}`);
 	}
 	return {
-		version: input.version === undefined ? 1 : input.version === 1 ? 1 : (() => { throw configError("version", "must be 1"); })(),
+		version: 2,
+		...(inputVersion === 1 ? { configMigration: "v1-to-v2" as const } : {}),
 		defaults: {
 			timeoutMs: readPositiveInteger(defaultsInput.timeoutMs, "defaults.timeoutMs", 180000),
 			panePolicy: readPanePolicy(defaultsInput.panePolicy, "defaults.panePolicy", "new-tab"),
@@ -243,8 +301,13 @@ export function parseDelegateConfig(value: unknown): DelegateConfig {
 		},
 		agents,
 		roles,
-		pipelines: { default: { maxStages } },
+		pipelines: { default: { maxStages, concurrency } },
 	};
+}
+
+/** Returns an immutable copy of the built-in concurrency policy. */
+export function defaultConcurrencyConfig(): ConcurrencyConfig {
+	return { ...DEFAULT_CONCURRENCY };
 }
 
 /** Returns the selected role, falling back to a built-in role only when it is known. */

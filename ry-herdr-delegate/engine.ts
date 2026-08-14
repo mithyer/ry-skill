@@ -16,6 +16,7 @@ import type {
 	DelegateResult,
 	HerdrAgentSnapshot,
 	HerdrGateway,
+	HerdrPane,
 	JsonlEvent,
 	NewJsonlEvent,
 	PanePolicy,
@@ -63,6 +64,16 @@ interface LeafRuntime {
 	workspaceId: string;
 	agent: string;
 	paneId: string;
+	/** Absolute deadline shared by every operation in this stage attempt. */
+	deadlineAt?: number;
+	/** Durable attempt/fencing identity. */
+	attempt?: number;
+	fencingToken?: string;
+	/** Resource metadata copied into each stage checkpoint. */
+	resourceKeys?: readonly string[];
+	access?: string;
+	/** Workspace layout lock retained until each pane mutation completes. */
+	layoutLock?: <T>(callback: () => Promise<T>) => Promise<T>;
 	session?: SessionIdentity;
 }
 
@@ -88,13 +99,13 @@ interface PiSessionMessage {
 function event(
 	type: NewJsonlEvent["type"],
 	actor: NewJsonlEvent["actor"],
-	runtime: Pick<LeafRuntime, "transaction" | "stageRole" | "stageOccurrence">,
+	runtime: LeafRuntime,
 	payload: Record<string, unknown>,
 	messageId?: string,
 	agentSession?: SessionIdentity,
 ): NewJsonlEvent {
 	return {
-		schemaVersion: 1,
+		schemaVersion: runtime.attempt !== undefined || runtime.fencingToken ? 2 : 1,
 		eventId: `${type}-${randomUUID()}`,
 		timestamp: new Date().toISOString(),
 		type,
@@ -104,7 +115,14 @@ function event(
 		stageOccurrence: runtime.stageOccurrence,
 		...(messageId ? { messageId } : {}),
 		...(agentSession ? { agentSession } : {}),
-		payload,
+		payload: {
+			...payload,
+			...(runtime.attempt !== undefined ? { attempt: runtime.attempt } : {}),
+			...(runtime.fencingToken ? { fencingToken: runtime.fencingToken } : {}),
+			...(runtime.resourceKeys ? { resourceKeys: runtime.resourceKeys } : {}),
+			...(runtime.access ? { access: runtime.access } : {}),
+			...(runtime.deadlineAt !== undefined ? { deadlineAt: new Date(runtime.deadlineAt).toISOString() } : {}),
+		},
 	};
 }
 
@@ -260,6 +278,9 @@ export class DelegateEngine {
 		const transaction = request.transaction ?? `tx-${id()}`;
 		const stageOccurrence = request.stageOccurrence ?? 1;
 		const owner = context.executionOwner ?? "parent";
+		const requestedDeadline = request.deadlineAt ? Date.parse(request.deadlineAt) : Number.NaN;
+		const deadlineAt = Number.isFinite(requestedDeadline) ? requestedDeadline : Date.now() + profile.timeoutMs + 30_000;
+		if (deadlineAt <= Date.now()) throw new Error("delegate stage deadline has expired");
 		if (request.previousSession && !request.previousCommunication) throw new Error("exact stage continuation requires its previous communication log");
 		const communicationFile = request.communicationFile ?? request.previousCommunication ?? communicationPath(communicationDirectory, role, id());
 		const runtime: LeafRuntime = {
@@ -274,6 +295,12 @@ export class DelegateEngine {
 			workspaceId: context.workspaceId,
 			agent: request.previousAgent ?? `${role}-${id()}`,
 			paneId: request.previousPaneId ?? "pending",
+			deadlineAt,
+			attempt: request.attempt,
+			fencingToken: request.fencingToken,
+			resourceKeys: context.resourceKeys ?? request.resourceKeys,
+			access: context.access ?? request.access,
+			layoutLock: context.layoutLock,
 		};
 		await debug.log("leaf.run.start", {
 			transaction,
@@ -292,6 +319,15 @@ export class DelegateEngine {
 			hasPreviousSession: Boolean(request.previousSession),
 			task: { length: request.task.length, sha256: hashDebugText(request.task) },
 		}, "info");
+		const deadlineController = new AbortController();
+		const abortOperation = (): void => {
+			if (!deadlineController.signal.aborted) deadlineController.abort(signal?.reason ?? new Error("delegate stage deadline expired"));
+		};
+		if (signal?.aborted) abortOperation();
+		else signal?.addEventListener("abort", abortOperation, { once: true });
+		const deadlineTimer = setTimeout(abortOperation, Math.max(1, deadlineAt - Date.now()));
+		deadlineTimer.unref?.();
+		const operationSignal = deadlineController.signal;
 		try {
 			const existing = Boolean(request.previousCommunication);
 			if (existing) {
@@ -338,7 +374,7 @@ export class DelegateEngine {
 				lineCount: handoff.lineCount,
 				idempotent: handoff.idempotent,
 			}, "trace");
-			const existingAgent = await this.reuseExistingPane(runtime, request, owner);
+			const existingAgent = await this.reuseExistingPane(runtime, request, owner, operationSignal);
 			if (existingAgent) {
 				await debug.log("leaf.session.reused", {
 					communicationId: runtime.communicationId,
@@ -347,27 +383,32 @@ export class DelegateEngine {
 					status: existingAgent.status,
 					agentSession: existingAgent.agentSession,
 				}, "debug");
-				await this.relayAndAwaitTurn(existingAgent.agent, relay, profile.timeoutMs, signal);
+				await this.relayAndAwaitTurn(existingAgent.agent, relay, profile.timeoutMs, operationSignal, runtime.deadlineAt);
 				await debug.log("leaf.relay.sent", { communicationId: runtime.communicationId, agent: existingAgent.agent, paneId: existingAgent.paneId, messageType, waitForTurn: true }, "debug");
-				return await this.waitAndResolve(runtime, profile.timeoutMs, owner, messageId, signal);
+				return await this.waitAndResolve(runtime, profile.timeoutMs, owner, messageId, operationSignal);
 			}
 			await debug.log("leaf.pane.split.start", { communicationId: runtime.communicationId, sourcePaneId: context.sourcePaneId, cwd: runtime.cwd }, "debug");
 			const finalArgs = buildFinalAgentArgs(profile, request.previousSession);
-			const pane = await this.dependencies.gateway.splitPane({
+			const splitPane = (): Promise<HerdrPane> => this.dependencies.gateway.splitPane({
 				sourcePaneId: context.sourcePaneId,
 				direction: "right",
 				cwd: runtime.cwd,
 				env: profile.env,
 				focus: false,
+				signal: operationSignal,
 			});
+			// Pane creation is serialized, but relay/wait remains outside the layout lock.
+			const pane = context.layoutLock ? await context.layoutLock(splitPane) : await splitPane();
 			runtime.paneId = pane.paneId;
 			await debug.log("leaf.pane.split.result", { communicationId: runtime.communicationId, paneId: pane.paneId, workspaceId: pane.workspaceId, tabId: pane.tabId }, "debug");
-			const started = await this.dependencies.gateway.startAgent({
+			const startAgent = (): Promise<HerdrAgentSnapshot> => this.dependencies.gateway.startAgent({
 				name: runtime.agent,
 				kind: profile.kind,
 				paneId: pane.paneId,
 				agentArgs: finalArgs,
+				signal: operationSignal,
 			});
+			const started = context.layoutLock ? await context.layoutLock(startAgent) : await startAgent();
 			runtime.paneId = started.paneId;
 			await debug.log("leaf.agent.started", {
 				communicationId: runtime.communicationId,
@@ -386,6 +427,9 @@ export class DelegateEngine {
 					paneId: started.paneId,
 					agent: started.agent,
 					cwd: started.cwd,
+					operation: "start",
+					accepted: true,
+					observedTransportStatus: started.status,
 					error: "Herdr did not return exact agent_session metadata",
 				}, undefined, request.previousSession));
 				return failureResult(runtime, "BLOCKED", "Herdr did not return exact agent_session metadata");
@@ -415,14 +459,21 @@ export class DelegateEngine {
 				paneId: started.paneId,
 				agent: started.agent,
 				cwd: started.cwd,
+				operation: "start",
+				accepted: true,
+				observedTransportStatus: started.status,
 			}, undefined, observedSession));
-			await this.relayAndAwaitTurn(started.agent, relay, profile.timeoutMs, signal);
+			await this.relayAndAwaitTurn(started.agent, relay, profile.timeoutMs, operationSignal, runtime.deadlineAt);
 			await debug.log("leaf.relay.sent", { communicationId: runtime.communicationId, agent: started.agent, paneId: started.paneId, messageType, waitForTurn: true }, "debug");
-			return await this.waitAndResolve(runtime, profile.timeoutMs, owner, messageId, signal);
+			return await this.waitAndResolve(runtime, profile.timeoutMs, owner, messageId, operationSignal);
 		} catch (error) {
 			await debug.log("leaf.run.failed", { communicationId: runtime.communicationId, transaction: runtime.transaction, stageRole: runtime.stageRole, error: debugError(error) }, "error");
 			await appendEvent(communicationFile, event("error", owner, runtime, { error: error instanceof Error ? error.message : String(error) })).catch(() => undefined);
-			return failureResult(runtime, "ERROR", error);
+			const deadlineExpired = runtime.deadlineAt !== undefined && Date.now() >= runtime.deadlineAt;
+			return failureResult(runtime, operationSignal.aborted || deadlineExpired ? "PARTIAL" : "ERROR", operationSignal.aborted || deadlineExpired ? "delegate stage operation was aborted" : error);
+		} finally {
+			clearTimeout(deadlineTimer);
+			signal?.removeEventListener("abort", abortOperation);
 		}
 	}
 
@@ -439,8 +490,10 @@ export class DelegateEngine {
 	 * @returns A promise that settles once Herdr sees the submitted child turn finish.
 	 * TEST:engine.test.ts[DelegateEngine completes a leaf only after exact checkpoint and DONE contract]
 	 */
-	private async relayAndAwaitTurn(agent: string, relay: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
-		await this.dependencies.gateway.prompt({ target: agent, text: relay, wait: true, timeoutMs, signal });
+	private async relayAndAwaitTurn(agent: string, relay: string, timeoutMs: number, signal?: AbortSignal, deadlineAt?: number): Promise<void> {
+		const remaining = deadlineAt === undefined ? timeoutMs : deadlineAt - Date.now();
+		if (remaining <= 0) throw new Error("delegate stage deadline expired before relay");
+		await this.dependencies.gateway.prompt({ target: agent, text: relay, wait: true, timeoutMs: Math.max(1, Math.min(timeoutMs, remaining)), signal });
 	}
 
 	/**
@@ -453,11 +506,14 @@ export class DelegateEngine {
 	 * TEST:engine.test.ts[DelegateEngine rereads a stale terminal snapshot before parsing the completion contract]
 	 * TEST:engine.test.ts[DelegateEngine falls back to the exact Pi session when Herdr terminal rows wrap]
 	 */
-	private async captureCompletion(runtime: LeafRuntime, relayMessageId: string): Promise<CapturedCompletion> {
+	private async captureCompletion(runtime: LeafRuntime, relayMessageId: string, signal?: AbortSignal): Promise<CapturedCompletion> {
 		const sleep = this.dependencies.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
 		let completion: CompletionContract | undefined;
 		for (let attempt = 1; attempt <= MAX_OUTPUT_CAPTURE_ATTEMPTS; attempt += 1) {
-			const output = (await this.dependencies.gateway.readAgent(runtime.agent)).text;
+			if (runtime.deadlineAt !== undefined && Date.now() >= runtime.deadlineAt) {
+				return { completion: errorCompletionContract(new Error("delegate stage deadline expired during output capture")), attempts: attempt - 1, source: "terminal" };
+			}
+			const output = (await this.dependencies.gateway.readAgent(runtime.agent, signal)).text;
 			try {
 				completion = parseCompletionContract(output);
 				await debug.log("leaf.output.contract-found", {
@@ -480,7 +536,10 @@ export class DelegateEngine {
 				}, attempt === MAX_OUTPUT_CAPTURE_ATTEMPTS ? "warn" : "trace");
 				const sessionCompletion = await this.capturePiSessionCompletion(runtime, relayMessageId);
 				if (sessionCompletion) return sessionCompletion;
-				if (attempt < MAX_OUTPUT_CAPTURE_ATTEMPTS) await sleep(OUTPUT_CAPTURE_RETRY_MS);
+				if (attempt < MAX_OUTPUT_CAPTURE_ATTEMPTS) {
+					const delay = runtime.deadlineAt === undefined ? OUTPUT_CAPTURE_RETRY_MS : Math.min(OUTPUT_CAPTURE_RETRY_MS, Math.max(1, runtime.deadlineAt - Date.now()));
+					await sleep(delay);
+				}
 			}
 		}
 		return { completion: completion!, attempts: MAX_OUTPUT_CAPTURE_ATTEMPTS, source: "terminal" };
@@ -520,10 +579,10 @@ export class DelegateEngine {
 	}
 
 	/** Reuses an open exact-session pane and blocks on unknown or mismatched transport state. */
-	private async reuseExistingPane(runtime: LeafRuntime, request: DelegateRequest, owner: "parent" | "coordinator"): Promise<HerdrAgentSnapshot | undefined> {
+	private async reuseExistingPane(runtime: LeafRuntime, request: DelegateRequest, owner: "parent" | "coordinator", signal?: AbortSignal): Promise<HerdrAgentSnapshot | undefined> {
 		if (!request.previousCommunication || !request.previousSession || !request.previousAgent) return undefined;
 		try {
-			const snapshot = await this.dependencies.gateway.getAgent(request.previousAgent);
+			const snapshot = await this.dependencies.gateway.getAgent(request.previousAgent, signal);
 			if (snapshot.status === "unknown" || !snapshot.agentSession || !sameSession(snapshot.agentSession, request.previousSession)) {
 				throw new Error("previous stage pane is open but exact session metadata is missing or mismatched");
 			}
@@ -562,7 +621,9 @@ export class DelegateEngine {
 			}, "debug");
 			let snapshot;
 			try {
-				snapshot = await this.dependencies.gateway.waitFor({ target: runtime.agent, until: ["idle", "done", "blocked", "unknown"], timeoutMs, signal });
+				const remaining = runtime.deadlineAt === undefined ? timeoutMs : runtime.deadlineAt - Date.now();
+				if (remaining <= 0) return failureResult(runtime, "PARTIAL", "delegate stage deadline expired");
+				snapshot = await this.dependencies.gateway.waitFor({ target: runtime.agent, until: ["idle", "done", "blocked", "unknown"], timeoutMs: Math.max(1, Math.min(timeoutMs, remaining)), signal });
 				runtime.paneId = snapshot.paneId;
 				await debug.log("leaf.wait.result", {
 					communicationId: runtime.communicationId,
@@ -581,6 +642,8 @@ export class DelegateEngine {
 					}, "warn");
 					await appendEvent(runtime.communicationFile, event("checkpoint", owner, runtime, {
 						transportStatus: snapshot.status,
+						operation: "wait",
+						accepted: "unknown",
 						paneId: snapshot.paneId,
 						agent: snapshot.agent,
 						error: "Herdr wait returned missing or mismatched exact agent_session metadata",
@@ -593,6 +656,9 @@ export class DelegateEngine {
 					paneId: snapshot.paneId,
 					agent: snapshot.agent,
 					cwd: snapshot.cwd,
+					operation: "wait",
+					accepted: true,
+					observedTransportStatus: snapshot.status,
 				}, undefined, snapshot.agentSession));
 			} catch (error) {
 				await debug.log("leaf.wait.failed", {
@@ -603,6 +669,8 @@ export class DelegateEngine {
 				}, "warn");
 				await appendEvent(runtime.communicationFile, event("checkpoint", owner, runtime, {
 					transportStatus: "unknown",
+					operation: "wait",
+					accepted: "unknown",
 					error: error instanceof Error ? error.message : String(error),
 				})).catch(() => undefined);
 				return failureResult(runtime, "PARTIAL", error);
@@ -613,7 +681,7 @@ export class DelegateEngine {
 			}
 			let captured: CapturedCompletion;
 			try {
-				captured = await this.captureCompletion(runtime, relayMessageId);
+				captured = await this.captureCompletion(runtime, relayMessageId, signal);
 				await debug.log("leaf.output.read", {
 					communicationId: runtime.communicationId,
 					agent: runtime.agent,
@@ -628,6 +696,11 @@ export class DelegateEngine {
 			const completion = captured.completion;
 			await appendEvent(runtime.communicationFile, event("result", "child-output-capture", runtime, {
 				status: completion.status,
+				operation: "read",
+				accepted: true,
+				observedTransportStatus: snapshot.status,
+				captureAttempt: captured.attempts,
+				relayMessageId,
 				summary: completion.summary,
 				changedFiles: completion.changedFiles,
 				validation: completion.validation,
@@ -665,27 +738,32 @@ export class DelegateEngine {
 					tabLabel: disposition.tabLabel,
 				}, "debug");
 				try {
-					if (disposition.policy === "close") await this.dependencies.gateway.closePane(runtime.paneId);
-					if (disposition.policy === "new-tab") {
-						const moved = await this.dependencies.gateway.movePane({
-							paneId: runtime.paneId,
-							newTab: true,
-							tabLabel: disposition.tabLabel!,
-							workspaceId: runtime.workspaceId,
-							focus: false,
-						});
-						await appendEvent(runtime.communicationFile, event("pane-disposition", owner, runtime, {
-							policy: disposition.policy,
-							tabLabel: disposition.tabLabel,
-							tabId: moved.tabId,
-							paneId: runtime.paneId,
-						}));
-					} else {
-						await appendEvent(runtime.communicationFile, event("pane-disposition", owner, runtime, {
-							policy: disposition.policy,
-							paneId: runtime.paneId,
-						}));
-					}
+					const applyDisposition = async (): Promise<void> => {
+						if (disposition.policy === "close") await this.dependencies.gateway.closePane(runtime.paneId, signal);
+						if (disposition.policy === "new-tab") {
+							const moved = await this.dependencies.gateway.movePane({
+								paneId: runtime.paneId,
+								newTab: true,
+								tabLabel: disposition.tabLabel!,
+								workspaceId: runtime.workspaceId,
+								focus: false,
+								signal,
+							});
+							await appendEvent(runtime.communicationFile, event("pane-disposition", owner, runtime, {
+								policy: disposition.policy,
+								tabLabel: disposition.tabLabel,
+								tabId: moved.tabId,
+								paneId: runtime.paneId,
+							}));
+						} else {
+							await appendEvent(runtime.communicationFile, event("pane-disposition", owner, runtime, {
+								policy: disposition.policy,
+								paneId: runtime.paneId,
+							}));
+						}
+					};
+					if (runtime.layoutLock) await runtime.layoutLock(applyDisposition);
+					else await applyDisposition();
 				} catch (error) {
 					await debug.log("leaf.disposition.failed", { communicationId: runtime.communicationId, policy: disposition.policy, paneId: runtime.paneId, error: debugError(error) }, "warn");
 					return { ...failureResult(runtime, "PARTIAL", error), completion };
@@ -729,19 +807,4 @@ function isDefinitivelyClosedAgentLookup(error: unknown): boolean {
 	if (candidate.code === 404 || candidate.code === "ENOENT") return true;
 	const text = [candidate.message, candidate.stderr].filter((value): value is string => typeof value === "string").join(" ").toLowerCase();
 	return text.includes("agent_not_found") || (text.includes("agent target") && text.includes("not found")) || text.includes("not found") || text.includes("unknown agent") || text.includes("no such agent");
-}
-
-/** Builds a fixed continuation envelope after a blocked or incomplete result. */
-function buildContinuationEnvelope(file: string, runtime: LeafRuntime, status: SemanticStatus): string {
-	return [
-		`COMMUNICATION FILE: ${file}`,
-		`MESSAGE SEQ: latest`,
-		`MESSAGE LINES: latest`,
-		`MESSAGE LINE COUNT: 1`,
-		`MESSAGE ID: continuation-${runtime.communicationId}-${status}`,
-		"MESSAGE TYPE: continuation",
-		"",
-		"Read the latest checkpoint and result events before continuing the same stage.",
-		"Resolve only routine blockers already covered by the recorded task and return the full completion contract.",
-	].join("\n");
 }

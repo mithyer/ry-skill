@@ -116,12 +116,44 @@ export interface RoleConfig {
 export interface PipelineConfig {
 	/** Maximum stages accepted in one pipeline request. */
 	maxStages: number;
+	/** Bounded multi-stage worker policy persisted with each task. */
+	concurrency: ConcurrencyConfig;
+}
+
+/** Concurrency policy accepted by the version-2 configuration boundary. */
+export interface ConcurrencyConfig {
+	/** Whether explicit parallel plans may claim more than one stage. */
+	enabled: boolean;
+	/** Workspace coordinator worker-slot upper bound. */
+	maxAgents: number;
+	/** Maximum concurrently active pipelines. */
+	maxPipelines: number;
+	/** Per-pipeline active-stage upper bound. */
+	maxConcurrentStages: number;
+	/** Base active lease TTL before a stage-specific effective TTL is resolved. */
+	leaseTtlMs: number;
+	/** Startup grace included in a stage deadline and lease. */
+	startupGraceMs: number;
+	/** Terminal capture grace included in a stage deadline and lease. */
+	captureGraceMs: number;
+	/** Control-poll margin included in a stage deadline and lease. */
+	controlMarginMs: number;
+	/** Durable lease heartbeat interval. */
+	heartbeatMs: number;
+	/** Active-run control polling interval. */
+	controlPollMs: number;
+	/** Whether a propagated stage failure cancels sibling work. */
+	failFast: boolean;
+	/** Policy used when a resource declaration cannot be proven safe. */
+	unknownResourcePolicy: "block";
 }
 
 /** Parsed delegate configuration with validated top-level defaults. */
 export interface DelegateConfig {
-	/** Configuration schema version. */
+	/** Effective configuration schema version. */
 	version: number;
+	/** In-memory migration marker for a v1 input. */
+	configMigration?: "v1-to-v2";
 	/** Global invocation defaults. */
 	defaults: {
 		/** Default leaf timeout. */
@@ -170,6 +202,16 @@ export interface DelegateRequest {
 	previousSession?: SessionIdentity;
 	/** Preallocated communication log used for durable stage linkage. */
 	communicationFile?: string;
+	/** Absolute deadline shared by every operation in this stage attempt. */
+	deadlineAt?: string;
+	/** Durable attempt number assigned by the coordinator. */
+	attempt?: number;
+	/** Fencing token assigned by the coordinator lease. */
+	fencingToken?: string;
+	/** Canonical resource declarations used for retry and replay checks. */
+	resourceKeys?: readonly string[];
+	/** Access mode recorded for the stage attempt. */
+	access?: StageAccess;
 }
 
 /** Parent runtime context required to create a sibling Herdr pane. */
@@ -186,6 +228,12 @@ export interface DelegateContext {
 	executionOwner?: "parent" | "coordinator";
 	/** Whether non-empty profile environment has been verified for this runtime. */
 	childEnvVerified?: boolean;
+	/** Optional workspace layout lock used around pane mutations. */
+	layoutLock?: <T>(callback: () => Promise<T>) => Promise<T>;
+	/** Canonical resource declarations held by the caller's reservation. */
+	resourceKeys?: readonly string[];
+	/** Access mode held by the caller's reservation. */
+	access?: StageAccess;
 }
 
 /** One parsed completion contract returned by a child agent. */
@@ -252,6 +300,24 @@ export interface HerdrPane {
 	tabId?: string;
 }
 
+/** Accepted/unknown transport evidence needed to classify relay retries safely. */
+export interface TransportMetadata {
+	/** Herdr operation that produced the evidence. */
+	operation: "split" | "start" | "prompt" | "wait" | "read" | "disposition";
+	/** Whether the external operation was accepted by Herdr. */
+	accepted: boolean | "unknown";
+	/** Structured Herdr error code, when available. */
+	errorCode?: string;
+	/** Transport status observed alongside the operation. */
+	observedStatus?: AgentTransportStatus;
+	/** Relay/message identity associated with the operation. */
+	messageId?: string;
+	/** Exact session checkpoint observed with the operation. */
+	exactSession?: SessionIdentity;
+	/** Terminal capture attempt number. */
+	captureAttempt?: number;
+}
+
 /** Agent metadata returned by Herdr get/snapshot operations. */
 export interface HerdrAgentSnapshot extends HerdrPane {
 	/** Herdr agent target/name. */
@@ -262,6 +328,8 @@ export interface HerdrAgentSnapshot extends HerdrPane {
 	agentSession?: SessionIdentity;
 	/** Working directory reported by Herdr. */
 	cwd?: string;
+	/** Transport acknowledgement metadata retained for retry classification. */
+	transport?: TransportMetadata;
 }
 
 /** Input for an explicit source-pane split. */
@@ -276,6 +344,8 @@ export interface SplitPaneInput {
 	env?: Readonly<Record<string, string>>;
 	/** Whether the newly split pane receives UI focus. */
 	focus?: boolean;
+	/** Cancellation signal for the Herdr process. */
+	signal?: AbortSignal;
 }
 
 /** Input for starting a supported Herdr agent. */
@@ -288,6 +358,8 @@ export interface StartAgentInput {
 	paneId: string;
 	/** Final validated argv passed after `--`. */
 	agentArgs: readonly string[];
+	/** Cancellation signal for the Herdr process. */
+	signal?: AbortSignal;
 }
 
 /** Input for sending an agent prompt. */
@@ -326,6 +398,8 @@ export interface CreateTabInput {
 	label: string;
 	/** Whether to focus the new tab. */
 	focus?: boolean;
+	/** Cancellation signal for the Herdr process. */
+	signal?: AbortSignal;
 }
 
 /** Input for moving a pane into a new or existing tab. */
@@ -342,6 +416,8 @@ export interface MovePaneInput {
 	workspaceId?: string;
 	/** Whether the destination receives focus. */
 	focus?: boolean;
+	/** Cancellation signal for the Herdr process. */
+	signal?: AbortSignal;
 }
 
 /** Output captured from an agent pane. */
@@ -377,28 +453,63 @@ export interface HerdrGateway {
 	/** Waits for a requested transport state. */
 	waitFor(input: WaitInput): Promise<HerdrAgentSnapshot>;
 	/** Reads exact current agent metadata. */
-	getAgent(target: string): Promise<HerdrAgentSnapshot>;
+	getAgent(target: string, signal?: AbortSignal): Promise<HerdrAgentSnapshot>;
 	/** Captures recent agent output. */
-	readAgent(target: string): Promise<HerdrAgentOutput>;
+	readAgent(target: string, signal?: AbortSignal): Promise<HerdrAgentOutput>;
 	/** Creates a tab without changing focus by default. */
 	createTab(input: CreateTabInput): Promise<{ tabId: string; paneId?: string }>;
 	/** Moves or closes a pane after semantic completion. */
 	movePane(input: MovePaneInput): Promise<{ tabId?: string }>;
 	/** Closes a pane explicitly. */
-	closePane(paneId: string): Promise<void>;
+	closePane(paneId: string, signal?: AbortSignal): Promise<void>;
 	/** Reads the live Herdr snapshot. */
-	snapshot(): Promise<HerdrSnapshot>;
+	snapshot(signal?: AbortSignal): Promise<HerdrSnapshot>;
 	/** Optionally verifies the Herdr CLI version and JSON response contract. */
 	probe?(signal?: AbortSignal): Promise<HerdrCapabilities>;
 }
 
+/** Stage access modes used by the resource conflict matrix. */
+export type StageAccess = "read-only" | "workspace-write" | "external-side-effect";
+
+/** Detail state retained for one stage without widening the top-level pipeline status. */
+export type PipelineStageDetailStatus =
+	| "QUEUED"
+	| "CLAIMED"
+	| "RUNNING"
+	| "DONE"
+	| "ERROR"
+	| "PARTIAL"
+	| "BLOCKED"
+	| "CANCELLED"
+	| "STALE"
+	| "WAITING_FOR_ANSWER"
+	| "WAITING_FOR_APPROVAL";
+
 /** Event-log status values used by pipeline submission and coordinator queries. */
 export type PipelineStatus = "QUEUED" | "ACCEPTED" | "RUNNING" | "BLOCKED" | "DONE" | "PARTIAL" | "ERROR" | "STOPPED";
+
+/** Replay projection for one pipeline's reserved worker slots. */
+export interface ActivePipelineReservation {
+	/** Stable reservation identity. */
+	reservationId: string;
+	/** Pipeline represented by this reservation. */
+	pipelineId: string;
+	/** Number of coordinator worker slots reserved. */
+	reservedSlots: number;
+	/** Lease identities represented by this reservation. */
+	leaseIds: readonly string[];
+	/** Reservation epoch used to reject stale releases. */
+	reservationEpoch: number;
+	/** Coordinator owner epoch/fence. */
+	ownerEpoch: string;
+	/** Monotonic release sequence, when released. */
+	releaseSequence?: number;
+}
 
 /** Durable binding for one project/workspace coordinator child. */
 export interface CoordinatorBinding {
 	/** Binding schema version. */
-	schemaVersion: 1;
+	schemaVersion: 1 | 2;
 	/** Project root bound to this coordinator. */
 	projectRoot: string;
 	/** Herdr workspace containing the coordinator pane. */
@@ -417,8 +528,14 @@ export interface CoordinatorBinding {
 	status: AgentTransportStatus;
 	/** Path to the durable inbox JSONL file. */
 	inboxPath: string;
-	/** Active pipeline currently being processed, if any. */
+	/** Legacy active pipeline projection retained for v1 readers. */
 	activePipelineId?: string;
+	/** Replay-derived reservations currently held by this coordinator. */
+	activePipelineReservations?: readonly ActivePipelineReservation[];
+	/** Monotonic schema epoch used for writer fencing. */
+	schemaEpoch?: number;
+	/** Writer fence bound to the exact coordinator session/process. */
+	writerFence?: string;
 	/** Last parent/coordinator observation timestamp. */
 	lastSeenAt: string;
 }
@@ -437,6 +554,21 @@ export interface PipelineSubmission {
 	error?: string;
 }
 
+/** Targeted control actions shared by new API calls and compatibility wrappers. */
+export type PipelineControlAction = "answer" | "approve" | "reject" | "recover" | "stop";
+
+/** Durable target identity supplied with a pipeline control request. */
+export interface PipelineControlTarget {
+	/** Stable target stage identity. */
+	stageId?: string;
+	/** Stage occurrence expected by the caller. */
+	stageOccurrence?: number;
+	/** Attempt expected by the caller. */
+	expectedAttempt?: number;
+	/** Fencing token expected by the caller. */
+	expectedFence?: string;
+}
+
 /** Result returned after a coordinator tick or durable control event. */
 export interface PipelineControlResult {
 	/** Pipeline or control status. */
@@ -451,10 +583,16 @@ export interface PipelineControlResult {
 	currentStage?: string;
 	/** Human-readable blocker/error. */
 	error?: string;
+	/** Target stage identity when a control action was scoped. */
+	targetStageId?: string;
+	/** Durable control event id, when one was appended. */
+	controlId?: string;
 }
 
 /** One explicitly planned pipeline stage. */
 export interface PipelineStageInput {
+	/** Stable logical identity within the pipeline; legacy plans receive a generated id. */
+	stageId?: string;
 	/** Stage role used for profile and isolation resolution. */
 	role: string;
 	/** Optional stage-specific task; otherwise the pipeline task is used. */
@@ -471,6 +609,18 @@ export interface PipelineStageInput {
 	timeoutMs?: number;
 	/** Stage pane disposition. */
 	panePolicy?: PanePolicy;
+	/** Dependencies; omission is legacy serial, an explicit empty list is parallel-ready. */
+	dependsOn?: readonly string[];
+	/** Resource access mode used by the workspace conflict matrix. */
+	access?: StageAccess;
+	/** Canonical or user-declared resources required by this stage. */
+	resourceKeys?: readonly string[];
+	/** Whether failure propagates cancellation to sibling stages. */
+	failFast?: boolean;
+	/** Optional per-pipeline active-stage limit. */
+	maxConcurrentStages?: number;
+	/** Internal normalization marker persisted in task metadata. */
+	dependencyMode?: "legacy-serial" | "explicit";
 }
 
 /** Pipeline task request stored in the pipeline JSONL event log. */
@@ -493,6 +643,10 @@ export interface PipelineRequest {
 	lineCount: number;
 	/** Task event sequence. */
 	messageSeq: number;
+	/** Effective concurrency policy captured at submission time. */
+	concurrency?: ConcurrencyConfig;
+	/** Configuration migration marker, when a v1 input was upgraded in memory. */
+	configMigration?: "v1-to-v2";
 }
 
 /** Event actors allowed to append JSONL communication events. */
@@ -509,12 +663,19 @@ export type EventType =
 	| "status-changed"
 	| "result"
 	| "error"
-	| "pane-disposition";
+	| "pane-disposition"
+	| "stage-claimed"
+	| "stage-started"
+	| "stage-heartbeat"
+	| "stage-released"
+	| "pipeline.control"
+	| "stale-attempt-diagnostic"
+	| "stale-control-diagnostic";
 
 /** One validated, physically line-oriented JSONL event. */
 export interface JsonlEvent {
-	/** Event schema version. */
-	schemaVersion: 1;
+	/** Event schema version; v1 records remain replayable while v2 events add concurrency identity. */
+	schemaVersion: 1 | 2;
 	/** Monotonic one-based sequence number. */
 	seq: number;
 	/** Stable unique event id. */

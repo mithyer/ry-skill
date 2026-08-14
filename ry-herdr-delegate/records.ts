@@ -41,6 +41,13 @@ const EVENT_TYPES = new Set<EventType>([
 	"result",
 	"error",
 	"pane-disposition",
+	"stage-claimed",
+	"stage-started",
+	"stage-heartbeat",
+	"stage-released",
+	"pipeline.control",
+	"stale-attempt-diagnostic",
+	"stale-control-diagnostic",
 ]);
 
 /** Event actors accepted by the runtime event-log schema. */
@@ -104,7 +111,7 @@ function validateEvent(value: unknown, line?: number): JsonlEvent {
 	for (const key of Object.keys(value)) {
 		if (!EVENT_KEYS.has(key)) throw invalidEvent(`unknown top-level field ${key}`, line);
 	}
-	if (value.schemaVersion !== 1) throw invalidEvent("schemaVersion must be 1", line);
+	if (value.schemaVersion !== 1 && value.schemaVersion !== 2) throw invalidEvent("schemaVersion must be 1 or 2", line);
 	if (!Number.isSafeInteger(value.seq) || (value.seq as number) < 1) throw invalidEvent("seq must be a positive integer", line);
 	for (const key of ["eventId", "timestamp", "transaction", "stageRole"]) {
 		if (typeof value[key] !== "string" || (value[key] as string).length === 0) {
@@ -163,6 +170,8 @@ function parseEventLogText(text: string, file: string): LocatedJsonlEvent[] {
 
 /** Redacts sensitive object-key values before they enter the durable event log. */
 export function redactSensitivePayload(value: unknown, key?: string): unknown {
+	// Fencing tokens are durable protocol identities, not credentials; replay must compare them exactly.
+	if (key === "fencingToken") return value;
 	if (key && SENSITIVE_KEY.test(key)) return "[REDACTED]";
 	if (Array.isArray(value)) return value.map((item) => redactSensitivePayload(item));
 	if (isRecord(value)) {
