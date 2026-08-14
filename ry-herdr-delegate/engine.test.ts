@@ -37,6 +37,7 @@ interface FakeGatewayOptions {
 class FakeGateway implements HerdrGateway {
 	readonly calls: string[] = [];
 	lastPrompt?: PromptInput;
+	lastMove?: MovePaneInput;
 	private readonly childSnapshot: HerdrAgentSnapshot;
 	private readonly output: string;
 	private readonly outputs?: readonly string[];
@@ -94,7 +95,7 @@ class FakeGateway implements HerdrGateway {
 		return { text: output };
 	}
 	async createTab(_input: CreateTabInput): Promise<{ tabId: string; paneId?: string }> { this.calls.push("tab-create"); return { tabId: "w-test:t2" }; }
-	async movePane(_input: MovePaneInput): Promise<{ tabId?: string }> { this.calls.push("move"); return { tabId: "w-test:t2" }; }
+	async movePane(input: MovePaneInput): Promise<{ tabId?: string }> { this.calls.push("move"); this.lastMove = input; return { tabId: "w-test:t2" }; }
 	async closePane(_paneId: string): Promise<void> { this.calls.push("close"); }
 	async snapshot(): Promise<HerdrSnapshot> { this.calls.push("snapshot"); return { raw: {}, agents: [this.childSnapshot] }; }
 }
@@ -130,7 +131,12 @@ test("DelegateEngine completes a leaf only after exact checkpoint and DONE contr
 		});
 		assert.equal(result.status, "DONE");
 		assert.deepEqual(gateway.lastPrompt && { wait: gateway.lastPrompt.wait, timeoutMs: gateway.lastPrompt.timeoutMs }, { wait: true, timeoutMs: 300000 });
-		assert.deepEqual(gateway.calls, ["split", "start", "prompt", "wait", "read", "tab-create", "move"]);
+		assert.deepEqual(gateway.calls, ["split", "start", "prompt", "wait", "read", "move"]);
+		assert.equal(gateway.lastMove?.paneId, "w-test:p2");
+		assert.equal(gateway.lastMove?.newTab, true);
+		assert.equal(gateway.lastMove?.tabLabel, `closed-pane-${result.communicationId}`);
+		assert.equal(gateway.lastMove?.workspaceId, "w-test");
+		assert.equal(gateway.lastMove?.focus, false);
 		assert.ok(result.communicationFile.endsWith(".jsonl"));
 		const events = (await readEventLog(result.communicationFile)).events;
 		assert.equal(events.at(-1)?.event.type, "pane-disposition");

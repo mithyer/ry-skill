@@ -667,22 +667,17 @@ export class DelegateEngine {
 				try {
 					if (disposition.policy === "close") await this.dependencies.gateway.closePane(runtime.paneId);
 					if (disposition.policy === "new-tab") {
-						const createdTab = await this.dependencies.gateway.createTab({
-							workspaceId: runtime.workspaceId,
-							cwd: runtime.cwd,
-							label: disposition.tabLabel!,
-							focus: false,
-						});
 						const moved = await this.dependencies.gateway.movePane({
 							paneId: runtime.paneId,
-							tabId: createdTab.tabId,
+							newTab: true,
+							tabLabel: disposition.tabLabel!,
 							workspaceId: runtime.workspaceId,
 							focus: false,
 						});
 						await appendEvent(runtime.communicationFile, event("pane-disposition", owner, runtime, {
 							policy: disposition.policy,
 							tabLabel: disposition.tabLabel,
-							tabId: moved.tabId ?? createdTab.tabId,
+							tabId: moved.tabId,
 							paneId: runtime.paneId,
 						}));
 					} else {
