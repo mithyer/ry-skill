@@ -14,6 +14,10 @@ test("completion contract parsing distinguishes DONE from incomplete output", ()
 	assert.equal(indented.status, "DONE");
 	assert.equal(indented.summary, "rendered through Herdr text snapshot");
 	assert.equal(isSemanticDone(indented), true);
+	const tuiDecorated = parseCompletionContract("• STATUS: DONE\n⏺ SUMMARY: rendered through an agent TUI\n• VALIDATION: no files changed\n");
+	assert.equal(tuiDecorated.status, "DONE");
+	assert.equal(tuiDecorated.summary, "rendered through an agent TUI");
+	assert.equal(isSemanticDone(tuiDecorated), true);
 	assert.equal(errorCompletionContract(new Error("bad")).status, "ERROR");
 	assert.throws(() => parseCompletionContract("STATUS: DONE\nSUMMARY: missing validation"), /VALIDATION/);
 });
