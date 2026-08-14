@@ -18,7 +18,7 @@ import { DelegateEngine } from "./engine.ts";
 import { parseDelegateConfig } from "./config.ts";
 import { HerdrCliGateway } from "./herdr/client.ts";
 import { PipelineCoordinator } from "./pipeline-coordinator.ts";
-import { PipelineStore } from "./pipeline.ts";
+import { PipelineStore, type PipelineProgress } from "./pipeline.ts";
 import type { DelegateResult, PipelineControlResult, PipelineSubmission, SessionIdentity } from "./types.ts";
 
 /** Structured action names exposed by the project-owned runtime. */
@@ -150,6 +150,88 @@ function createPipelineCoordinator(ctx: ExtensionContext, config: ReturnType<typ
 	});
 }
 
+/** Footer key used by the parent Pi session for one active pipeline monitor. */
+const PIPELINE_UI_STATUS_KEY = "ry-herdr-delegate";
+
+/** Widget key used by the parent Pi session for detailed pipeline stage progress. */
+const PIPELINE_UI_WIDGET_KEY = "ry-herdr-delegate-pipeline";
+
+/** Poll interval for replaying durable pipeline progress into the parent UI. */
+const PIPELINE_UI_POLL_MS = 1000;
+
+/** Terminal states that stop the parent-side UI monitor while leaving the final view visible. */
+const TERMINAL_PIPELINE_STATUSES = new Set(["DONE", "ERROR", "PARTIAL", "STOPPED"]);
+
+/** Active parent-side pipeline monitors keyed by Pi session and pipeline identity. */
+const pipelineUiMonitors = new Map<string, { timer: ReturnType<typeof setInterval>; polling: boolean }>();
+
+/** Formats durable pipeline progress for the footer and editor widget without exposing task text. */
+export function formatPipelineUi(progress: Pick<PipelineProgress, "state" | "stages">): string[] {
+	const lines = [`Herdr pipeline ${progress.state.pipelineId} · ${progress.state.status}`];
+	if (progress.state.currentStage) lines.push(`Current stage: ${progress.state.currentStage}`);
+	for (const stage of progress.stages) {
+		const details = [stage.status, stage.agent, stage.paneId ? `pane ${stage.paneId}` : undefined].filter((value): value is string => Boolean(value));
+		lines.push(`${stage.stageIndex + 1}. ${stage.role} · ${details.join(" · ")}`);
+	}
+	if (progress.state.summary) lines.push(`Summary: ${progress.state.summary}`);
+	return lines;
+}
+
+/** Pushes one replayed pipeline snapshot into Pi's footer and widget surfaces. */
+function renderPipelineUi(ctx: ExtensionContext, progress: PipelineProgress): void {
+	const status = progress.state.status;
+	ctx.ui.setStatus(PIPELINE_UI_STATUS_KEY, `pipeline ${progress.state.pipelineId} · ${status}`);
+	ctx.ui.setWidget(PIPELINE_UI_WIDGET_KEY, formatPipelineUi(progress));
+}
+
+/** Builds a stable monitor key that prevents duplicate timers for one parent pipeline. */
+function pipelineUiMonitorKey(ctx: ExtensionContext, pipelineId: string): string {
+	return `${ctx.cwd}:${ctx.sessionManager.getSessionFile() ?? "ephemeral"}:${pipelineId}`;
+}
+
+/** Stops one parent-side pipeline monitor without clearing its final UI snapshot. */
+function stopPipelineUiMonitor(key: string): void {
+	const monitor = pipelineUiMonitors.get(key);
+	if (!monitor) return;
+	clearInterval(monitor.timer);
+	pipelineUiMonitors.delete(key);
+}
+
+/** Starts non-blocking JSONL polling so the parent Pi UI reflects coordinator stage progress. */
+function startPipelineUiMonitor(ctx: ExtensionContext, config: ReturnType<typeof parseDelegateConfig>, workspaceId: string, pipelineId: string): void {
+	const key = pipelineUiMonitorKey(ctx, pipelineId);
+	stopPipelineUiMonitor(key);
+	const coordinator = createPipelineCoordinator(ctx, config, workspaceId);
+	const monitor = {
+		timer: undefined as unknown as ReturnType<typeof setInterval>,
+		polling: false,
+	};
+	const poll = async (): Promise<void> => {
+		if (monitor.polling) return;
+		monitor.polling = true;
+		try {
+			const progress = await coordinator.progress(pipelineId);
+			renderPipelineUi(ctx, progress);
+			if (TERMINAL_PIPELINE_STATUSES.has(progress.state.status)) stopPipelineUiMonitor(key);
+		} catch (error) {
+			ctx.ui.setStatus(PIPELINE_UI_STATUS_KEY, `pipeline ${pipelineId} · ERROR`);
+			ctx.ui.setWidget(PIPELINE_UI_WIDGET_KEY, [`Herdr pipeline ${pipelineId} · ERROR`, error instanceof Error ? error.message : String(error)]);
+			stopPipelineUiMonitor(key);
+		} finally {
+			monitor.polling = false;
+		}
+	};
+	monitor.timer = setInterval(() => { void poll(); }, PIPELINE_UI_POLL_MS);
+	monitor.timer.unref?.();
+	pipelineUiMonitors.set(key, monitor);
+	void poll();
+}
+
+/** Stops all parent-side monitors when the Pi extension session is replaced or shut down. */
+function stopAllPipelineUiMonitors(): void {
+	for (const key of pipelineUiMonitors.keys()) stopPipelineUiMonitor(key);
+}
+
 /** Executes the currently implemented leaf or pipeline actions. */
 export async function executeDelegateTool(
 	params: DelegateToolParams,
@@ -182,6 +264,9 @@ export async function executeDelegateTool(
 		});
 		try {
 			const result = await executeDelegateToolWithConfig(params, ctx, signal, config);
+			if (params.action === "pipeline" && result.details?.submission?.pipelineId && workspaceId && result.details.status !== "ERROR") {
+				startPipelineUiMonitor(ctx, config, workspaceId, result.details.submission.pipelineId);
+			}
 			await debug.log("tool.request.result", { action: params.action, status: result.details?.status, communicationFile: result.details?.communicationFile });
 			return result;
 		} catch (error) {
@@ -415,4 +500,7 @@ export function registerDelegateTool(pi: ExtensionAPI): void {
 		handler: createDelegateCommandHandler(),
 	});
 	pi.on("input", createAutomaticDelegateInputHandler());
+	pi.on("session_shutdown", () => {
+		stopAllPipelineUiMonitors();
+	});
 }

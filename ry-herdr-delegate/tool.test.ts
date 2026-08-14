@@ -13,6 +13,7 @@ import {
 	createAutomaticDelegateInputHandler,
 	createDelegateCommandHandler,
 	detectAutomaticDelegateRequest,
+	formatPipelineUi,
 	registerDelegateTool,
 	type DelegateToolDetails,
 	type DelegateToolParams,
@@ -40,6 +41,31 @@ function makeExecutor(calls: DelegateToolParams[]): (params: DelegateToolParams,
 		return { content: [{ type: "text", text: "DONE" }], details: { status: "DONE" } };
 	};
 }
+
+/** Verifies parent UI formatting exposes pipeline and stage progress without task or child output text. */
+test("formatPipelineUi renders coordinator and stage status", () => {
+	const lines = formatPipelineUi({
+		state: {
+			pipelineId: "pipeline-demo",
+			communicationFile: "/tmp/pipeline-demo.jsonl",
+			status: "RUNNING",
+			lastSeq: 9,
+			currentStage: "worker",
+			summary: "stage is executing",
+		},
+		stages: [
+			{ stageIndex: 0, role: "worker", status: "RUNNING", lastEventSeq: 8, lastOutcomeSeq: 0, agent: "codex", paneId: "w-test:p2" },
+			{ stageIndex: 1, role: "reviewer", status: "QUEUED", lastEventSeq: 3, lastOutcomeSeq: 0 },
+		],
+	});
+	assert.deepEqual(lines, [
+		"Herdr pipeline pipeline-demo · RUNNING",
+		"Current stage: worker",
+		"1. worker · RUNNING · codex · pane w-test:p2",
+		"2. reviewer · QUEUED",
+		"Summary: stage is executing",
+	]);
+});
 
 /** Verifies explicit Chinese/English agent directives and incidental/negative exclusions. */
 test("detectAutomaticDelegateRequest routes actionable Codex and Claude prompts", () => {

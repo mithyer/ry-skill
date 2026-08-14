@@ -643,6 +643,11 @@ export class PipelineCoordinator {
 	async status(pipelineId: string): Promise<ReturnType<PipelineStore["readState"]>> {
 		return this.dependencies.pipelineStore.readState(pipelineId);
 	}
+
+	/** Returns replayed pipeline and per-stage progress for parent UI monitoring. */
+	async progress(pipelineId: string): Promise<PipelineProgress> {
+		return this.dependencies.pipelineStore.readProgress(pipelineId, this.dependencies.config.pipelines.default.maxStages);
+	}
 }
 
 /** Recognizes a Herdr lookup failure that proves the prior coordinator target is closed. */
