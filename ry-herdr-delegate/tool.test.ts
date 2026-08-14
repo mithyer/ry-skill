@@ -13,6 +13,7 @@ import {
 	createAutomaticDelegateInputHandler,
 	createDelegateCommandHandler,
 	detectAutomaticDelegateRequest,
+	formatDelegateToolResult,
 	formatPipelineUi,
 	registerDelegateTool,
 	type DelegateToolDetails,
@@ -65,6 +66,26 @@ test("formatPipelineUi renders coordinator and stage status", () => {
 		"2. reviewer · QUEUED",
 		"Summary: stage is executing",
 	]);
+});
+
+/** Verifies tool transcripts expose only actionable identifiers instead of raw JSON paths and sessions. */
+test("formatDelegateToolResult hides raw delegation metadata", () => {
+	const summary = formatDelegateToolResult({
+		status: "QUEUED",
+		submission: {
+			status: "QUEUED",
+			pipelineId: "pipeline-demo",
+			communicationFile: "/private/project/pipelines/pipeline-demo.jsonl",
+			coordinator: {
+				paneId: "w-test:p2",
+				agent: "pipeline-coordinator-demo",
+				agentSession: { kind: "path", source: "herdr:pi", value: "/private/session.jsonl" },
+				workspaceId: "w-test",
+			},
+		},
+	});
+	assert.equal(summary, "Pipeline QUEUED: pipeline-demo\\nCoordinator pane: w-test:p2");
+	assert.doesNotMatch(summary, /communicationFile|agentSession|private|\\{/);
 });
 
 /** Verifies explicit Chinese/English agent directives and incidental/negative exclusions. */
@@ -128,13 +149,19 @@ test("createDelegateCommandHandler executes the supplied task", async () => {
 });
 
 /** Verifies the extension registers both executable direct-entry surfaces. */
-test("registerDelegateTool wires the executable command and input router", () => {
+	test("registerDelegateTool wires the executable command and input router", () => {
 	let toolRegistered = false;
+	let renderCallRegistered = false;
+	let renderResultRegistered = false;
 	let commandName: string | undefined;
 	let commandDescription: string | undefined;
 	let inputRegistered = false;
 	const extensionApi = {
-		registerTool: () => { toolRegistered = true; },
+		registerTool: (definition: { renderCall?: unknown; renderResult?: unknown }) => {
+			toolRegistered = true;
+			renderCallRegistered = typeof definition.renderCall === "function";
+			renderResultRegistered = typeof definition.renderResult === "function";
+		},
 		registerCommand: (name: string, options: { description?: string }) => {
 			commandName = name;
 			commandDescription = options.description;
@@ -145,6 +172,8 @@ test("registerDelegateTool wires the executable command and input router", () =>
 	} as unknown as ExtensionAPI;
 	registerDelegateTool(extensionApi);
 	assert.equal(toolRegistered, true);
+	assert.equal(renderCallRegistered, true);
+	assert.equal(renderResultRegistered, true);
 	assert.equal(commandName, "ry-herdr-delegate");
 	assert.match(commandDescription ?? "", /Execute one Herdr delegate leaf task/);
 	assert.equal(inputRegistered, true);

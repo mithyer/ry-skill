@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { Text } from "@earendil-works/pi-tui";
 import type {
 	AgentToolResult,
 	ExtensionAPI,
@@ -9,7 +10,9 @@ import type {
 	ExtensionContext,
 	InputEvent,
 	InputEventResult,
+	Theme,
 	ToolDefinition,
+	ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 
@@ -125,10 +128,59 @@ async function loadGlobalConfig(): Promise<ReturnType<typeof parseDelegateConfig
 	}
 }
 
-/** Formats a result into Pi's text content while retaining structured details. */
+/** Formats structured tool details into a compact transcript-safe summary. */
+export function formatDelegateToolResult(details: DelegateToolDetails): string {
+	const lines: string[] = [];
+	if (details.submission) {
+		lines.push(`Pipeline ${details.submission.status}: ${details.submission.pipelineId}`);
+		lines.push(`Coordinator pane: ${details.submission.coordinator.paneId}`);
+	}
+	if (details.control) {
+		lines.push(`Pipeline ${details.control.status}: ${details.control.pipelineId ?? "current"}`);
+		if (details.control.stagesProcessed !== undefined) lines.push(`Stages processed: ${details.control.stagesProcessed}`);
+		if (details.control.currentStage) lines.push(`Current stage: ${details.control.currentStage}`);
+	}
+	if (details.pipelineState && typeof details.pipelineState === "object") {
+		const state = details.pipelineState as { pipelineId?: unknown; status?: unknown; currentStage?: unknown; summary?: unknown };
+		if (typeof state.pipelineId === "string" && typeof state.status === "string") {
+			lines.push(`Pipeline ${state.status}: ${state.pipelineId}`);
+			if (typeof state.currentStage === "string") lines.push(`Current stage: ${state.currentStage}`);
+			if (typeof state.summary === "string") lines.push(`Summary: ${state.summary}`);
+		}
+	}
+	if (details.result) {
+		lines.push(`Delegate ${details.result.status}: ${details.result.communicationId}`);
+		if (details.result.agent) lines.push(`Agent: ${details.result.agent}`);
+		if (details.result.paneId) lines.push(`Pane: ${details.result.paneId}`);
+		if (details.result.completion?.summary) lines.push(`Summary: ${details.result.completion.summary}`);
+	}
+	if (details.error) lines.push(`Error: ${details.error}`);
+	if (lines.length === 0) lines.push(`Herdr delegate: ${details.status}`);
+	return lines.join("\\n");
+}
+
+/** Formats the tool call header without exposing task text or structured arguments. */
+function formatDelegateToolCall(args: Partial<DelegateToolParams>, theme: Theme): Text {
+	return new Text(theme.fg("toolTitle", `Herdr Delegate · ${args.action ?? "request"}`), 0, 0);
+}
+
+/** Renders the compact result row while the full state remains in details and JSONL. */
+function renderDelegateToolResult(
+	result: AgentToolResult<DelegateToolDetails>,
+	options: ToolRenderResultOptions,
+	theme: Theme,
+	isError: boolean,
+): Text {
+	if (options.isPartial) return new Text(theme.fg("warning", "Herdr Delegate · working..."), 0, 0);
+	const summary = formatDelegateToolResult(result.details ?? { status: "UNKNOWN" });
+	const color = isError ? "error" : result.details?.status === "DONE" ? "success" : "accent";
+	return new Text(theme.fg(color, summary), 0, 0);
+}
+
+/** Formats a result into compact Pi text while retaining structured details for runtime consumers. */
 function toolResult(details: DelegateToolDetails, isError = false): AgentToolResult<DelegateToolDetails> {
 	return {
-		content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
+		content: [{ type: "text", text: formatDelegateToolResult(details) }],
 		details,
 		...(isError ? { isError: true } : {}),
 	};
@@ -491,6 +543,8 @@ export function registerDelegateTool(pi: ExtensionAPI): void {
 		promptSnippet: "Use the structured Herdr delegate runtime for leaf or pipeline work",
 		promptGuidelines: ["Use action=delegate for one leaf stage, action=pipeline for non-blocking submission, pipeline.status for replayed state, pipeline.answer or pipeline.stop for durable control, and pipeline.coordinator only from the exact coordinator pane/session."],
 		parameters: DelegateToolParameters,
+		renderCall: (args, theme) => formatDelegateToolCall(args, theme),
+		renderResult: (result, options, theme, context) => renderDelegateToolResult(result, options, theme, context.isError),
 		executionMode: "sequential",
 		execute: async (_toolCallId, params, signal, _onUpdate, ctx) => executeDelegateTool(params, ctx, signal),
 	};
