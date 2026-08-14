@@ -176,9 +176,9 @@ class DelegateTextComponent implements DelegateRenderComponent {
 		this.text = text;
 	}
 
-	/** Returns the styled row independently of the available terminal width. */
+	/** Returns each styled summary line independently for Pi's TUI renderer. */
 	render(_width: number): string[] {
-		return [this.text];
+		return this.text.split("\n");
 	}
 
 	/** Invalidates no caches because the component owns immutable text. */
