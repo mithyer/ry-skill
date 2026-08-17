@@ -137,8 +137,8 @@ test("createAutomaticDelegateInputHandler executes an actionable prompt", async 
 
 /** Verifies automatic Claude routing renders the resolved external child status in the parent UI. */
 test("createAutomaticDelegateInputHandler displays the resolved Claude agent status", async () => {
-	const statuses: string[] = [];
-	const widgets: string[][] = [];
+	const statuses: Array<string | undefined> = [];
+	const widgets: Array<string[] | undefined> = [];
 	const executor = async (): Promise<AgentToolResult<DelegateToolDetails>> => ({
 		content: [{ type: "text", text: "DONE" }],
 		details: {
@@ -156,10 +156,11 @@ test("createAutomaticDelegateInputHandler displays the resolved Claude agent sta
 	const handler = createAutomaticDelegateInputHandler(executor);
 	const result = await handler({ type: "input", text: "请使用 Claude 审查这次修改", source: "interactive" }, makeContext(true, statuses, widgets));
 	assert.deepEqual(result, { action: "handled" });
-	assert.deepEqual(statuses, ["Herdr delegate · RUNNING · claude", "Herdr delegate · DONE · claude-child"]);
+	assert.deepEqual(statuses, ["Herdr delegate · RUNNING · claude", "Herdr delegate · DONE · claude-child", undefined]);
 	assert.deepEqual(widgets, [
 		["Herdr delegate · RUNNING", "Agent: claude"],
 		["Herdr delegate · DONE", "Agent: claude-child", "Pane: w-test:p2", "Summary: Claude read-only validation complete"],
+		undefined,
 	]);
 });
 
@@ -182,9 +183,10 @@ test("createAutomaticDelegateInputHandler does not intercept non-direct prompts"
 /** Verifies the slash command passes its argument to the delegate leaf instead of showing a status-only notice. */
 test("createDelegateCommandHandler executes the supplied task and updates direct status", async () => {
 	const calls: DelegateToolParams[] = [];
-	const statuses: string[] = [];
-	const widgets: string[][] = [];
-	const handler = createDelegateCommandHandler(makeExecutor(calls));
+	const statuses: Array<string | undefined> = [];
+	const widgets: Array<string[] | undefined> = [];
+	const transcript: Array<Record<string, unknown>> = [];
+	const handler = createDelegateCommandHandler(makeExecutor(calls), (entry) => transcript.push(entry as unknown as Record<string, unknown>));
 	await handler("fix the requested issue", makeContext(true, statuses, widgets) as ExtensionCommandContext);
 	assert.equal(calls.length, 1);
 	assert.equal(calls[0].action, "delegate");
@@ -192,8 +194,75 @@ test("createDelegateCommandHandler executes the supplied task and updates direct
 	assert.equal(calls[0].agent, "codex");
 	assert.equal(calls[0].timeoutMs, 600000);
 	assert.equal(calls[0].task, "fix the requested issue");
-	assert.deepEqual(statuses, ["Herdr delegate · RUNNING · codex", "Herdr delegate · DONE · codex"]);
-	assert.deepEqual(widgets, [["Herdr delegate · RUNNING", "Agent: codex"], ["Herdr delegate · DONE", "Agent: codex"]]);
+	assert.deepEqual(statuses, ["Herdr delegate · RUNNING · codex", "Herdr delegate · DONE · codex", undefined]);
+	assert.deepEqual(widgets, [["Herdr delegate · RUNNING", "Agent: codex"], ["Herdr delegate · DONE", "Agent: codex"], undefined]);
+	assert.deepEqual(transcript, [
+		{ kind: "prompt", prompt: "/ry-herdr-agent fix the requested issue" },
+		{ kind: "result", status: "DONE", agent: "codex" },
+	]);
+});
+
+/** Verifies the slash command persists a complete conclusion with agent work and validation details. */
+test("createDelegateCommandHandler persists the agent conclusion", async () => {
+	const transcript: Array<Record<string, unknown>> = [];
+	const executor = async (): Promise<AgentToolResult<DelegateToolDetails>> => ({
+		content: [{ type: "text", text: "DONE" }],
+		details: {
+			status: "DONE",
+			result: {
+				status: "DONE",
+				communicationId: "communication-summary",
+				communicationFile: "/private/communication-summary.jsonl",
+				agent: "worker-summary",
+				paneId: "w-test:p4",
+				completion: {
+					status: "DONE",
+					summary: "Added the requested tests",
+					validation: "npm test passed",
+					changedFiles: "tool.ts and tool.test.ts",
+				},
+			},
+		},
+	});
+	const handler = createDelegateCommandHandler(executor, (entry) => transcript.push(entry as unknown as Record<string, unknown>));
+	await handler("implement and test the requested change", makeContext() as ExtensionCommandContext);
+	assert.deepEqual(transcript, [
+		{ kind: "prompt", prompt: "/ry-herdr-agent implement and test the requested change" },
+		{
+			kind: "result",
+			status: "DONE",
+			agent: "worker-summary",
+			summary: "Added the requested tests",
+			validation: "npm test passed",
+			changedFiles: "tool.ts and tool.test.ts",
+		},
+	]);
+});
+
+/** Verifies an unresolved child displays an animated polling indicator before closure. */
+test("direct delegate UI shows a listening spinner while monitoring", async () => {
+	const statuses: Array<string | undefined> = [];
+	const widgets: Array<string[] | undefined> = [];
+	let reads = 0;
+	const ctx = makeContext(true, statuses, widgets);
+	const gateway = {
+		getAgent: async () => {
+			reads += 1;
+			if (reads === 1) return { paneId: "w-test:p4" };
+			throw Object.assign(new Error("agent_not_found"), { code: "agent_not_found" });
+		},
+	} as unknown as HerdrGateway;
+	startDirectDelegateUiMonitor(ctx, gateway, "worker-summary", "w-test:p4", 1, {
+		status: "PARTIAL",
+		agent: "worker-summary",
+		paneId: "w-test:p4",
+		summary: "Waiting for explicit continuation",
+	});
+	await new Promise<void>((resolve) => setTimeout(resolve, 10));
+	assert.equal(statuses.some((status) => typeof status === "string" && status.includes("LISTENING")), true);
+	assert.equal(widgets.some((lines) => lines?.some((line) => line.includes("State: PARTIAL"))), true);
+	assert.equal(statuses.at(-1), undefined);
+	assert.equal(widgets.at(-1), undefined);
 });
 
 /** Verifies a closed child target clears the persistent parent status and widget surfaces. */
@@ -219,6 +288,8 @@ test("registerDelegateTool wires the executable command and input router", () =>
 	let renderResultRegistered = false;
 	let commandName: string | undefined;
 	let commandDescription: string | undefined;
+	let entryRendererRegistered = false;
+	let entryAppended = false;
 	let inputRegistered = false;
 	const extensionApi = {
 		registerTool: (definition: { renderCall?: unknown; renderResult?: unknown }) => {
@@ -230,6 +301,12 @@ test("registerDelegateTool wires the executable command and input router", () =>
 			commandName = name;
 			commandDescription = options.description;
 		},
+		registerEntryRenderer: () => {
+			entryRendererRegistered = true;
+		},
+		appendEntry: () => {
+			entryAppended = true;
+		},
 		on: (event: string) => {
 			if (event === "input") inputRegistered = true;
 		},
@@ -238,6 +315,8 @@ test("registerDelegateTool wires the executable command and input router", () =>
 	assert.equal(toolRegistered, true);
 	assert.equal(renderCallRegistered, true);
 	assert.equal(renderResultRegistered, true);
+	assert.equal(entryRendererRegistered, true);
+	assert.equal(entryAppended, false);
 	assert.equal(commandName, "ry-herdr-agent");
 	assert.match(commandDescription ?? "", /Execute one Herdr delegate leaf task/);
 	assert.equal(inputRegistered, true);

@@ -87,9 +87,37 @@ export interface DelegateToolDetails {
 	pipelineState?: unknown;
 	/** Stable communication file when available. */
 	communicationFile?: string;
-	/** Human-readable error or unsupported-action explanation. */
+	/** Human-readable error or blocker explanation. */
 	error?: string;
 }
+
+/** Custom entry type used for durable slash-command prompts and conclusions. */
+const DIRECT_TRANSCRIPT_ENTRY = "ry-herdr-agent";
+
+/** One TUI-only transcript entry for a direct slash-command interaction. */
+interface DirectTranscriptEntry {
+	/** Whether this entry preserves the submitted command or its conclusion. */
+	kind: "prompt" | "result";
+	/** Complete slash command shown for a preserved prompt. */
+	prompt?: string;
+	/** Semantic result status shown in the conclusion. */
+	status?: string;
+	/** Resolved external agent target. */
+	agent?: string;
+	/** Child-reported description of work performed. */
+	summary?: string;
+	/** Child-reported validation and its outcome. */
+	validation?: string;
+	/** Child-reported changed-file summary. */
+	changedFiles?: string;
+	/** Child-reported remaining risks. */
+	risks?: string;
+	/** Runtime error or continuity explanation. */
+	error?: string;
+}
+
+/** Persists one direct slash-command transcript entry. */
+type DirectTranscriptWriter = (entry: DirectTranscriptEntry) => void;
 
 /** Agents that can be selected by an explicit natural-language delegation directive. */
 export type AutomaticDelegateAgent = "codex" | "claude";
@@ -314,6 +342,9 @@ function renderPipelineUi(ctx: ExtensionContext, progress: PipelineProgress): vo
 /** Poll interval for confirming that a terminal direct child pane still exists. */
 const DIRECT_UI_POLL_MS = 1000;
 
+/** ASCII frames used to show that an unresolved child pane is still being monitored. */
+const DIRECT_UI_SPINNER = ["|", "/", "-", "\\"] as const;
+
 /** Active direct-leaf UI monitors keyed by the parent session surface. */
 type DirectUiMonitor = {
 	/** Parent context whose status and widget are being monitored. */
@@ -324,6 +355,10 @@ type DirectUiMonitor = {
 	agent: string;
 	/** Child pane shown in the parent UI. */
 	paneId: string;
+	/** Final direct result details retained while the pane remains unresolved. */
+	details: DirectUiDetails;
+	/** Current ASCII spinner frame used while polling the child. */
+	spinnerIndex: number;
 	/** Poll timer for child lifecycle checks. */
 	timer: ReturnType<typeof setInterval>;
 	/** Prevents overlapping Herdr lookups. */
@@ -378,6 +413,7 @@ function stopDirectUiMonitor(ctx: ExtensionContext, clearSurface: boolean): void
  * @param agent Exact Herdr child target to monitor.
  * @param paneId Pane shown in the parent status surface.
  * @param pollMs Lifecycle polling interval in milliseconds.
+ * @param details Final result details retained while the child remains unresolved.
  * @returns Nothing; cleanup is performed asynchronously when the child closes.
  * TEST:ry-herdr-delegate/tool.test.ts[direct delegate UI clears after child closure]
  */
@@ -387,6 +423,7 @@ export function startDirectDelegateUiMonitor(
 	agent: string,
 	paneId: string,
 	pollMs = DIRECT_UI_POLL_MS,
+	details?: DirectUiDetails,
 ): void {
 	if (ctx.mode !== "tui") return;
 	stopDirectUiMonitor(ctx, false);
@@ -396,10 +433,18 @@ export function startDirectDelegateUiMonitor(
 		gateway,
 		agent,
 		paneId,
+		details: details ?? { status: "LISTENING", agent, paneId },
+		spinnerIndex: 0,
 		timer: undefined as unknown as ReturnType<typeof setInterval>,
 		polling: false,
 	};
+	const renderListeningUi = (): void => {
+		const frame = DIRECT_UI_SPINNER[monitor.spinnerIndex % DIRECT_UI_SPINNER.length];
+		monitor.spinnerIndex += 1;
+		renderDirectDelegateUi(monitor.ctx, { ...monitor.details, monitorFrame: frame });
+	};
 	const poll = async (): Promise<void> => {
+		renderListeningUi();
 		if (monitor.polling) return;
 		monitor.polling = true;
 		try {
@@ -427,7 +472,7 @@ function stopAllDirectUiMonitors(): void {
 }
 
 /** Direct-leaf state used by the parent Pi status and widget surfaces. */
-interface DirectUiDetails {
+export interface DirectUiDetails {
 	/** Semantic or transport status shown to the parent user. */
 	status: string;
 	/** External agent target, when the runtime has resolved one. */
@@ -438,6 +483,14 @@ interface DirectUiDetails {
 	paneId?: string;
 	/** Sanitized completion summary shown after the child settles. */
 	summary?: string;
+	/** Child-reported validation shown with the completion summary. */
+	validation?: string;
+	/** Child-reported changed-file summary shown with the completion summary. */
+	changedFiles?: string;
+	/** Child-reported remaining risks shown with the completion summary. */
+	risks?: string;
+	/** Current monitor spinner frame, present only while lifecycle polling is active. */
+	monitorFrame?: string;
 	/** Redacted error text shown for a failed request. */
 	error?: string;
 }
@@ -454,12 +507,17 @@ function renderDirectDelegateUi(ctx: ExtensionContext, details: DirectUiDetails)
 	const statusKey = directUiSurfaceKey(ctx, PIPELINE_UI_STATUS_PREFIX);
 	const widgetKey = directUiSurfaceKey(ctx, "ry-herdr-delegate-direct");
 	const agent = details.agent ?? details.role;
-	const statusText = agent ? `Herdr delegate · ${details.status} · ${agent}` : `Herdr delegate · ${details.status}`;
+	const displayStatus = details.monitorFrame ? `LISTENING ${details.monitorFrame}` : details.status;
+	const statusText = agent ? `Herdr delegate · ${displayStatus} · ${agent}` : `Herdr delegate · ${displayStatus}`;
 	const lines = [
-		`Herdr delegate · ${details.status}`,
+		`Herdr delegate · ${displayStatus}`,
+		details.monitorFrame ? `State: ${details.status}` : undefined,
 		agent ? `Agent: ${agent}` : undefined,
 		details.paneId ? `Pane: ${details.paneId}` : undefined,
 		details.summary ? `Summary: ${details.summary}` : undefined,
+		details.validation ? `Validation: ${details.validation}` : undefined,
+		details.changedFiles ? `Changed files: ${details.changedFiles}` : undefined,
+		details.risks ? `Risks: ${details.risks}` : undefined,
 		details.error ? `Error: ${details.error}` : undefined,
 	].filter((line): line is string => line !== undefined);
 	ctx.ui.setStatus(statusKey, statusText);
@@ -555,16 +613,22 @@ export async function executeDelegateTool(
 		try {
 			const result = await executeDelegateToolWithConfig(params, ctx, signal, config, directGateway);
 			if (params.action === "delegate" && result.details) {
-				renderDirectDelegateUi(ctx, {
+				const directDetails: DirectUiDetails = {
 					status: result.details.status,
 					agent: result.details.result?.agent,
 					paneId: result.details.result?.paneId,
 					summary: result.details.result?.completion?.summary,
+					validation: result.details.result?.completion?.validation,
+					changedFiles: result.details.result?.completion?.changedFiles,
+					risks: result.details.result?.completion?.risks,
 					error: result.details.error,
-				});
+				};
+				renderDirectDelegateUi(ctx, directDetails);
 				const directResult = result.details.result;
-				if (directGateway && directResult?.agent && directResult.paneId) {
-					startDirectDelegateUiMonitor(ctx, directGateway, directResult.agent, directResult.paneId);
+				if (directGateway && directResult?.status !== "DONE" && directResult?.agent && directResult.paneId) {
+					startDirectDelegateUiMonitor(ctx, directGateway, directResult.agent, directResult.paneId, DIRECT_UI_POLL_MS, directDetails);
+				} else {
+					clearDirectDelegateUi(ctx);
 				}
 			}
 			if (params.action === "pipeline" && result.details?.submission?.pipelineId && workspaceId && result.details.status !== "ERROR") {
@@ -608,13 +672,29 @@ type DelegateExecutor = (
 /** Formats a compact user-facing result without dumping task text or child output. */
 function formatDelegateNotification(result: AgentToolResult<DelegateToolDetails>): string {
 	const details = result.details;
+	const completion = details?.result?.completion;
 	const status = details?.status ?? "UNKNOWN";
-	const summary = details?.result?.completion?.summary ?? details?.error;
-	const communicationFile = details?.communicationFile;
 	return [
 		`ry_herdr_delegate_tool: ${status}`,
-		summary ? `SUMMARY: ${summary}` : undefined,
-		communicationFile ? `COMMUNICATION: ${communicationFile}` : undefined,
+		details?.result?.agent ? `AGENT: ${details.result.agent}` : undefined,
+		completion?.summary ? `SUMMARY: ${completion.summary}` : details?.error ? `ERROR: ${details.error}` : undefined,
+		completion?.validation ? `VALIDATION: ${completion.validation}` : undefined,
+		completion?.changedFiles ? `CHANGED FILES: ${completion.changedFiles}` : undefined,
+		completion?.risks ? `RISKS: ${completion.risks}` : undefined,
+	].filter((line): line is string => line !== undefined).join("\n");
+}
+
+/** Formats one durable direct-command entry for the interactive transcript. */
+function formatDirectTranscriptEntry(entry: DirectTranscriptEntry): string {
+	if (entry.kind === "prompt") return `Herdr agent prompt\n${entry.prompt ?? "/ry-herdr-agent"}`;
+	return [
+		`Herdr agent conclusion · ${entry.status ?? "UNKNOWN"}`,
+		entry.agent ? `Agent: ${entry.agent}` : undefined,
+		entry.summary ? `What the agent did: ${entry.summary}` : undefined,
+		entry.validation ? `Result validation: ${entry.validation}` : undefined,
+		entry.changedFiles ? `Changed files: ${entry.changedFiles}` : undefined,
+		entry.risks ? `Remaining risks: ${entry.risks}` : undefined,
+		entry.error ? `Error: ${entry.error}` : undefined,
 	].filter((line): line is string => line !== undefined).join("\n");
 }
 
@@ -630,6 +710,7 @@ async function runDirectDelegate(
 	ctx: ExtensionContext,
 	overrides: DirectDelegateOverrides,
 	executor: DelegateExecutor,
+	transcriptWriter?: DirectTranscriptWriter,
 ): Promise<void> {
 	ctx.ui.setWorkingMessage("Running Herdr delegate...");
 	ctx.ui.setWorkingVisible(true);
@@ -637,17 +718,41 @@ async function runDirectDelegate(
 	try {
 		const result = await executor({ action: "delegate", task, role: overrides.role, agent: overrides.agent, timeoutMs: overrides.timeoutMs }, ctx, ctx.signal);
 		const details = result.details;
-		renderDirectDelegateUi(ctx, {
-			status: details?.status ?? "UNKNOWN",
-			agent: details?.result?.agent ?? overrides.agent,
-			paneId: details?.result?.paneId,
-			summary: details?.result?.completion?.summary,
-			error: details?.error,
-		});
+		const status = details?.status ?? "UNKNOWN";
+		const agent = details?.result?.agent ?? overrides.agent;
+		const paneId = details?.result?.paneId;
+		const completion = details?.result?.completion;
+		const hasUnresolvedChild = status !== "DONE" && Boolean(agent && paneId);
+		if (!hasUnresolvedChild) {
+			renderDirectDelegateUi(ctx, {
+				status,
+				agent,
+				paneId,
+				summary: completion?.summary,
+				validation: completion?.validation,
+				changedFiles: completion?.changedFiles,
+				risks: completion?.risks,
+				error: details?.error,
+			});
+		}
+		// Keep optional fields absent from the persisted entry so session JSON stays concise and deterministic.
+		const transcriptEntry: DirectTranscriptEntry = { kind: "result", status };
+		if (agent) transcriptEntry.agent = agent;
+		if (completion?.summary) transcriptEntry.summary = completion.summary;
+		if (completion?.validation) transcriptEntry.validation = completion.validation;
+		if (completion?.changedFiles) transcriptEntry.changedFiles = completion.changedFiles;
+		if (completion?.risks) transcriptEntry.risks = completion.risks;
+		if (details?.error) transcriptEntry.error = details.error;
+		transcriptWriter?.(transcriptEntry);
 		ctx.ui.notify(formatDelegateNotification(result), delegateNotificationType(result));
+		if (!hasUnresolvedChild) stopDirectUiMonitor(ctx, true);
 	} catch (error) {
-		renderDirectDelegateUi(ctx, { status: "ERROR", role: overrides.role, agent: overrides.agent, error: error instanceof Error ? error.message : String(error) });
-		ctx.ui.notify(`ry_herdr_delegate_tool: ERROR\n${error instanceof Error ? error.message : String(error)}`, "error");
+		const message = error instanceof Error ? error.message : String(error);
+		transcriptWriter?.({ kind: "result", status: "ERROR", agent: overrides.agent, error: message });
+		stopDirectUiMonitor(ctx, true);
+		renderDirectDelegateUi(ctx, { status: "ERROR", role: overrides.role, agent: overrides.agent, error: message });
+		ctx.ui.notify(`ry_herdr_delegate_tool: ERROR\n${message}`, "error");
+		clearDirectDelegateUi(ctx);
 	} finally {
 		ctx.ui.setWorkingVisible(false);
 		ctx.ui.setWorkingMessage();
@@ -657,17 +762,22 @@ async function runDirectDelegate(
 /**
  * Creates the slash-command handler that executes a supplied task as a leaf.
  * @param executor Runtime executor, injectable for command regression tests.
+ * @param transcriptWriter Optional durable writer for the slash prompt and final conclusion.
  * @returns A Pi command handler accepting the task after `/ry-herdr-agent`.
  * TEST:ry-herdr-delegate/tool.test.ts[createDelegateCommandHandler]
  */
-export function createDelegateCommandHandler(executor: DelegateExecutor = executeDelegateTool): (args: string, ctx: ExtensionCommandContext) => Promise<void> {
+export function createDelegateCommandHandler(
+	executor: DelegateExecutor = executeDelegateTool,
+	transcriptWriter?: DirectTranscriptWriter,
+): (args: string, ctx: ExtensionCommandContext) => Promise<void> {
 	return async (args, ctx) => {
 		const task = args.trim();
 		if (!task) {
 			ctx.ui.notify("Usage: /ry-herdr-agent <task>", "warning");
 			return;
 		}
-		await runDirectDelegate(task, ctx, selectSlashDelegateOverrides(task), executor);
+		transcriptWriter?.({ kind: "prompt", prompt: `/ry-herdr-agent ${task}` });
+		await runDirectDelegate(task, ctx, selectSlashDelegateOverrides(task), executor, transcriptWriter);
 	};
 }
 
@@ -897,6 +1007,14 @@ async function executeDelegateToolWithConfig(
 
 /** Registers the structured tool, executable slash command, and direct-agent input router. */
 export function registerDelegateTool(pi: ExtensionAPI): void {
+	pi.registerEntryRenderer<DirectTranscriptEntry>(DIRECT_TRANSCRIPT_ENTRY, (entry, _options, theme) => {
+		const data = entry.data ?? { kind: "result", status: "UNKNOWN" as const };
+		const color = data.kind === "prompt" ? "accent" : data.status === "DONE" ? "success" : "warning";
+		return new DelegateTextComponent(theme.fg(color, formatDirectTranscriptEntry(data)));
+	});
+	const writeDirectTranscript: DirectTranscriptWriter = (entry) => {
+		pi.appendEntry(DIRECT_TRANSCRIPT_ENTRY, entry);
+	};
 	const definition: ToolDefinition<typeof DelegateToolParameters, DelegateToolDetails> = {
 		name: "ry_herdr_delegate_tool",
 		label: "Herdr Delegate",
@@ -912,7 +1030,7 @@ export function registerDelegateTool(pi: ExtensionAPI): void {
 	pi.registerTool(definition);
 	pi.registerCommand("ry-herdr-agent", {
 		description: "Execute one Herdr delegate leaf task: /ry-herdr-agent <task>",
-		handler: createDelegateCommandHandler(),
+		handler: createDelegateCommandHandler(executeDelegateTool, writeDirectTranscript),
 	});
 	pi.on("input", createAutomaticDelegateInputHandler());
 	pi.on("session_shutdown", () => {

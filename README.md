@@ -150,6 +150,13 @@ command, not a status-only command. Explicit directives such as `用codex` or
 implementation and validation tasks use Codex, and other tasks use Pi. Manual
 slash tasks selected for an external worker receive a 10-minute command budget
 so long-running builds are not cut off by the ordinary 180-second default.
+The slash prompt and the final agent conclusion are persisted as TUI-only
+session entries, so the command remains visible without triggering a second
+parent-model turn. The conclusion includes the resolved agent, work summary,
+validation, changed files, and remaining risks when reported. While an
+unresolved child is being monitored, the parent status shows an ASCII spinner;
+semantic `DONE` stops and clears the direct monitor surfaces after the
+conclusion is written.
 
 Before the model loop, the extension also detects an explicit actionable agent
 directive such as `请使用 codex 修复这个问题`, `使用 Claude 审查这次修改`, or
