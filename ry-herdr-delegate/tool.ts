@@ -23,7 +23,7 @@ import { HerdrCliGateway } from "./herdr/client.ts";
 import { PipelineCoordinator } from "./pipeline-coordinator.ts";
 import { canonicalCwdResourceKey, WorkspaceReservationLedger } from "./concurrency.ts";
 import { PipelineStore, type PipelineProgress } from "./pipeline.ts";
-import type { AgentKind, DelegateResult, PipelineControlResult, PipelineSubmission, SessionIdentity } from "./types.ts";
+import type { AgentKind, DelegateResult, HerdrGateway, PipelineControlResult, PipelineSubmission, SessionIdentity } from "./types.ts";
 
 /** Structured action names exposed by the project-owned runtime. */
 const ACTIONS = ["delegate", "pipeline", "pipeline.status", "pipeline.answer", "pipeline.approve", "pipeline.reject", "pipeline.stop", "pipeline.coordinator", "recover", "pipeline.recover"] as const;
@@ -311,6 +311,121 @@ function renderPipelineUi(ctx: ExtensionContext, progress: PipelineProgress): vo
 	ctx.ui.setWidget(pipelineUiSurfaceKey(ctx, progress.state.pipelineId, PIPELINE_UI_WIDGET_PREFIX), formatPipelineUi(progress));
 }
 
+/** Poll interval for confirming that a terminal direct child pane still exists. */
+const DIRECT_UI_POLL_MS = 1000;
+
+/** Active direct-leaf UI monitors keyed by the parent session surface. */
+type DirectUiMonitor = {
+	/** Parent context whose status and widget are being monitored. */
+	ctx: ExtensionContext;
+	/** Herdr gateway used to verify the exact child target. */
+	gateway: HerdrGateway;
+	/** Unique child target returned by Herdr. */
+	agent: string;
+	/** Child pane shown in the parent UI. */
+	paneId: string;
+	/** Poll timer for child lifecycle checks. */
+	timer: ReturnType<typeof setInterval>;
+	/** Prevents overlapping Herdr lookups. */
+	polling: boolean;
+};
+
+/** Active direct-leaf UI monitors keyed by the parent session surface. */
+const directUiMonitors = new Map<string, DirectUiMonitor>();
+
+/** Returns the parent-session key shared by the direct status surface and its lifecycle monitor. */
+function directUiMonitorKey(ctx: ExtensionContext): string {
+	return directUiSurfaceKey(ctx, PIPELINE_UI_STATUS_PREFIX);
+}
+
+/** Clears the parent-session direct delegate status and widget surfaces. */
+export function clearDirectDelegateUi(ctx: ExtensionContext): void {
+	if (ctx.mode !== "tui") return;
+	ctx.ui.setStatus(directUiSurfaceKey(ctx, PIPELINE_UI_STATUS_PREFIX), undefined);
+	ctx.ui.setWidget(directUiSurfaceKey(ctx, "ry-herdr-delegate-direct"), undefined);
+}
+
+/** Recognizes Herdr errors that prove the monitored direct child target no longer exists. */
+function isDirectAgentClosedError(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const candidate = error as { code?: unknown; message?: unknown; stdout?: unknown; stderr?: unknown };
+	if (candidate.code === 404 || candidate.code === "ENOENT") return true;
+	const text = [candidate.message, candidate.stdout, candidate.stderr]
+		.filter((value): value is string => typeof value === "string")
+		.join(" ")
+		.toLowerCase();
+	return text.includes("agent_not_found")
+		|| (text.includes("agent target") && text.includes("not found"))
+		|| text.includes("unknown agent")
+		|| text.includes("no such agent");
+}
+
+/** Stops the direct child monitor and optionally removes its parent UI surfaces. */
+function stopDirectUiMonitor(ctx: ExtensionContext, clearSurface: boolean): void {
+	const key = directUiMonitorKey(ctx);
+	const monitor = directUiMonitors.get(key);
+	if (monitor) {
+		clearInterval(monitor.timer);
+		directUiMonitors.delete(key);
+	}
+	if (clearSurface) clearDirectDelegateUi(ctx);
+}
+
+/**
+ * Monitors one terminal direct child until Herdr proves its target pane is closed.
+ * @param ctx Parent Pi extension context that owns the status surface.
+ * @param gateway Herdr gateway used for exact child lookups.
+ * @param agent Exact Herdr child target to monitor.
+ * @param paneId Pane shown in the parent status surface.
+ * @param pollMs Lifecycle polling interval in milliseconds.
+ * @returns Nothing; cleanup is performed asynchronously when the child closes.
+ * TEST:ry-herdr-delegate/tool.test.ts[direct delegate UI clears after child closure]
+ */
+export function startDirectDelegateUiMonitor(
+	ctx: ExtensionContext,
+	gateway: HerdrGateway,
+	agent: string,
+	paneId: string,
+	pollMs = DIRECT_UI_POLL_MS,
+): void {
+	if (ctx.mode !== "tui") return;
+	stopDirectUiMonitor(ctx, false);
+	const key = directUiMonitorKey(ctx);
+	const monitor = {
+		ctx,
+		gateway,
+		agent,
+		paneId,
+		timer: undefined as unknown as ReturnType<typeof setInterval>,
+		polling: false,
+	};
+	const poll = async (): Promise<void> => {
+		if (monitor.polling) return;
+		monitor.polling = true;
+		try {
+			const snapshot = await gateway.getAgent(agent);
+			if (snapshot.paneId !== paneId) stopDirectUiMonitor(ctx, true);
+		} catch (error) {
+			if (isDirectAgentClosedError(error)) stopDirectUiMonitor(ctx, true);
+		} finally {
+			monitor.polling = false;
+		}
+	};
+	monitor.timer = setInterval(() => { void poll(); }, Math.max(1, pollMs));
+	monitor.timer.unref?.();
+	directUiMonitors.set(key, monitor);
+	void poll();
+}
+
+/** Stops and clears every direct-leaf UI monitor owned by this extension session. */
+function stopAllDirectUiMonitors(): void {
+	for (const monitor of directUiMonitors.values()) {
+		clearInterval(monitor.timer);
+		directUiMonitors.delete(directUiMonitorKey(monitor.ctx));
+		clearDirectDelegateUi(monitor.ctx);
+	}
+}
+
 /** Direct-leaf state used by the parent Pi status and widget surfaces. */
 interface DirectUiDetails {
 	/** Semantic or transport status shown to the parent user. */
@@ -422,7 +537,9 @@ export async function executeDelegateTool(
 		configFile: GLOBAL_CONFIG_PATH,
 	});
 	return withDebugLogger(logger, async () => {
+		const directGateway = params.action === "delegate" ? new HerdrCliGateway({ cwd: ctx.cwd }) : undefined;
 		if (params.action === "delegate") {
+			stopDirectUiMonitor(ctx, false);
 			renderDirectDelegateUi(ctx, { status: "RUNNING", role: params.role, agent: params.agent });
 		}
 		await debug.log("tool.request.start", {
@@ -436,7 +553,7 @@ export async function executeDelegateTool(
 			stageCount: params.stages?.length,
 		});
 		try {
-			const result = await executeDelegateToolWithConfig(params, ctx, signal, config);
+			const result = await executeDelegateToolWithConfig(params, ctx, signal, config, directGateway);
 			if (params.action === "delegate" && result.details) {
 				renderDirectDelegateUi(ctx, {
 					status: result.details.status,
@@ -445,6 +562,10 @@ export async function executeDelegateTool(
 					summary: result.details.result?.completion?.summary,
 					error: result.details.error,
 				});
+				const directResult = result.details.result;
+				if (directGateway && directResult?.agent && directResult.paneId) {
+					startDirectDelegateUiMonitor(ctx, directGateway, directResult.agent, directResult.paneId);
+				}
 			}
 			if (params.action === "pipeline" && result.details?.submission?.pipelineId && workspaceId && result.details.status !== "ERROR") {
 				startPipelineUiMonitor(ctx, config, workspaceId, result.details.submission.pipelineId);
@@ -612,6 +733,7 @@ async function executeDelegateToolWithConfig(
 	ctx: ExtensionContext,
 	signal: AbortSignal | undefined,
 	config: ReturnType<typeof parseDelegateConfig>,
+	directGateway?: HerdrGateway,
 ): Promise<AgentToolResult<DelegateToolDetails>> {
 	if (params.action === "pipeline") {
 		if (!params.task) return toolResult({ status: "ERROR", error: "pipeline requires task" }, true);
@@ -714,7 +836,7 @@ async function executeDelegateToolWithConfig(
 
 	if (!params.task) return toolResult({ status: "ERROR", error: "delegate requires task" }, true);
 	if (ctx.mode !== "tui") return toolResult({ status: "BLOCKED", error: "delegate requires a Pi TUI context with a Herdr pane" }, true);
-	const gateway = new HerdrCliGateway({ cwd: ctx.cwd });
+	const gateway = directGateway ?? new HerdrCliGateway({ cwd: ctx.cwd });
 	const workspaceId = process.env.HERDR_WORKSPACE_ID;
 	const sourcePaneId = process.env.HERDR_PANE_ID;
 	if (!workspaceId || !sourcePaneId) {
@@ -795,5 +917,6 @@ export function registerDelegateTool(pi: ExtensionAPI): void {
 	pi.on("input", createAutomaticDelegateInputHandler());
 	pi.on("session_shutdown", () => {
 		stopAllPipelineUiMonitors();
+		stopAllDirectUiMonitors();
 	});
 }

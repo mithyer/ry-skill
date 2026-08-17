@@ -8,6 +8,7 @@ import type {
 	ExtensionContext,
 	InputEvent,
 } from "@earendil-works/pi-coding-agent";
+import type { HerdrGateway } from "./types.ts";
 
 import {
 	createAutomaticDelegateInputHandler,
@@ -17,12 +18,13 @@ import {
 	formatPipelineUi,
 	registerDelegateTool,
 	selectAgentForTask,
+	startDirectDelegateUiMonitor,
 	type DelegateToolDetails,
 	type DelegateToolParams,
 } from "./tool.ts";
 
 /** Builds the smallest UI surface needed by direct command and input-handler tests. */
-function makeContext(idle = true, statusCalls: string[] = [], widgetCalls: string[][] = []): ExtensionContext {
+function makeContext(idle = true, statusCalls: Array<string | undefined> = [], widgetCalls: Array<string[] | undefined> = []): ExtensionContext {
 	return {
 		mode: "tui",
 		cwd: "/tmp/project",
@@ -32,8 +34,8 @@ function makeContext(idle = true, statusCalls: string[] = [], widgetCalls: strin
 			notify: () => undefined,
 			setWorkingMessage: () => undefined,
 			setWorkingVisible: () => undefined,
-			setStatus: (_key: string, text: string) => { statusCalls.push(text); },
-			setWidget: (_key: string, lines: string[]) => { widgetCalls.push(lines); },
+			setStatus: (_key: string, text: string | undefined) => { statusCalls.push(text); },
+			setWidget: (_key: string, lines: string[] | undefined) => { widgetCalls.push(lines); },
 		},
 	} as unknown as ExtensionContext;
 }
@@ -192,6 +194,22 @@ test("createDelegateCommandHandler executes the supplied task and updates direct
 	assert.equal(calls[0].task, "fix the requested issue");
 	assert.deepEqual(statuses, ["Herdr delegate · RUNNING · codex", "Herdr delegate · DONE · codex"]);
 	assert.deepEqual(widgets, [["Herdr delegate · RUNNING", "Agent: codex"], ["Herdr delegate · DONE", "Agent: codex"]]);
+});
+
+/** Verifies a closed child target clears the persistent parent status and widget surfaces. */
+test("direct delegate UI clears after child closure", async () => {
+	const statuses: Array<string | undefined> = ["Herdr delegate · ERROR · codex"];
+	const widgets: Array<string[] | undefined> = [["Herdr delegate · ERROR", "Pane: w20:p3"]];
+	const ctx = makeContext(true, statuses, widgets);
+	const gateway = {
+		getAgent: async () => {
+			throw Object.assign(new Error("agent_not_found"), { code: "agent_not_found" });
+		},
+	} as unknown as HerdrGateway;
+	startDirectDelegateUiMonitor(ctx, gateway, "worker-c3fe678b-3e5", "w20:p3", 1);
+	await new Promise<void>((resolve) => setTimeout(resolve, 10));
+	assert.equal(statuses.at(-1), undefined);
+	assert.equal(widgets.at(-1), undefined);
 });
 
 /** Verifies the extension registers both executable direct-entry surfaces. */
