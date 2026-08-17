@@ -575,7 +575,7 @@ closed-pane-<communicationId>
 | 行为 | 处理方式 |
 | --- | --- |
 | 结构化 delegation | 由 `ry_herdr_delegate_tool` 执行 |
-| `/ry-herdr-delegate` | Extension command 转换为 tool request |
+| `/ry-herdr-agent` | Extension command 转换为 tool request |
 | `旧 /skill:ry-herdr-delegate` | 仅作为旧版本回滚材料；新 runtime 不读取其通信文件，也不将其请求转成 JSONL |
 | `用 Claude 写代码` | 当前 Pi 模型识别后调用 tool，并设置 invocation-local agent |
 | 任意自然语言意图分类 | 不在 Extension 内硬编码关键词 |

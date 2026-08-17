@@ -143,7 +143,7 @@ The extension does not silently fall back to the old skill, an external
 
 #### Direct invocation and automatic routing
 
-`/ry-herdr-delegate <task>` executes one leaf task through
+`/ry-herdr-agent <task>` executes one leaf task through
 `ry_herdr_delegate_tool` and reports its structured status. It is an execution
 command, not a status-only command. Explicit directives such as `用codex` or
 `使用 Claude` are honored; otherwise review or research tasks use Claude,

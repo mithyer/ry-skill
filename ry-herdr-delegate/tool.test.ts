@@ -170,7 +170,7 @@ test("createAutomaticDelegateInputHandler does not intercept non-direct prompts"
 	const prompts: InputEvent[] = [
 		{ type: "input", text: "Codex 和 Claude 有什么区别？", source: "interactive" },
 		{ type: "input", text: "不要使用 codex 修复这个问题", source: "interactive" },
-		{ type: "input", text: "/ry-herdr-delegate 请使用 codex 修复这个问题", source: "interactive" },
+		{ type: "input", text: "/ry-herdr-agent 请使用 codex 修复这个问题", source: "interactive" },
 		{ type: "input", text: "请使用 codex 修复这个问题", source: "interactive", streamingBehavior: "followUp" },
 	];
 	for (const event of prompts) assert.deepEqual(await handler(event, makeContext()), { action: "continue" });
@@ -238,7 +238,7 @@ test("registerDelegateTool wires the executable command and input router", () =>
 	assert.equal(toolRegistered, true);
 	assert.equal(renderCallRegistered, true);
 	assert.equal(renderResultRegistered, true);
-	assert.equal(commandName, "ry-herdr-delegate");
+	assert.equal(commandName, "ry-herdr-agent");
 	assert.match(commandDescription ?? "", /Execute one Herdr delegate leaf task/);
 	assert.equal(inputRegistered, true);
 });

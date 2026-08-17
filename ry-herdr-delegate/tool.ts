@@ -657,14 +657,14 @@ async function runDirectDelegate(
 /**
  * Creates the slash-command handler that executes a supplied task as a leaf.
  * @param executor Runtime executor, injectable for command regression tests.
- * @returns A Pi command handler accepting the task after `/ry-herdr-delegate`.
+ * @returns A Pi command handler accepting the task after `/ry-herdr-agent`.
  * TEST:ry-herdr-delegate/tool.test.ts[createDelegateCommandHandler]
  */
 export function createDelegateCommandHandler(executor: DelegateExecutor = executeDelegateTool): (args: string, ctx: ExtensionCommandContext) => Promise<void> {
 	return async (args, ctx) => {
 		const task = args.trim();
 		if (!task) {
-			ctx.ui.notify("Usage: /ry-herdr-delegate <task>", "warning");
+			ctx.ui.notify("Usage: /ry-herdr-agent <task>", "warning");
 			return;
 		}
 		await runDirectDelegate(task, ctx, selectSlashDelegateOverrides(task), executor);
@@ -910,8 +910,8 @@ export function registerDelegateTool(pi: ExtensionAPI): void {
 		execute: async (_toolCallId, params, signal, _onUpdate, ctx) => executeDelegateTool(params, ctx, signal),
 	};
 	pi.registerTool(definition);
-	pi.registerCommand("ry-herdr-delegate", {
-		description: "Execute one Herdr delegate leaf task: /ry-herdr-delegate <task>",
+	pi.registerCommand("ry-herdr-agent", {
+		description: "Execute one Herdr delegate leaf task: /ry-herdr-agent <task>",
 		handler: createDelegateCommandHandler(),
 	});
 	pi.on("input", createAutomaticDelegateInputHandler());
