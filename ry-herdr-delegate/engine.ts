@@ -24,6 +24,19 @@ import type {
 	SessionIdentity,
 } from "./types.ts";
 
+/** Detects terminal markers emitted when an external child turn is cancelled before its completion contract. */
+function isInterruptedChildOutput(text: string): boolean {
+	return /conversation interrupted/i.test(text)
+		|| /<turn_aborted\b/i.test(text)
+		|| /previous turn was interrupted on purpose/i.test(text);
+}
+
+/** Converts a child interruption into an explicit incomplete semantic result. */
+function interruptedCompletionContract(): CompletionContract {
+	const completion = errorCompletionContract(new Error("Child conversation was interrupted before completion contract"));
+	return { ...completion, status: "PARTIAL" };
+}
+
 /** Maximum number of automatic continuation attempts for an unfinished leaf. */
 const MAX_CONTINUATIONS = 3;
 
@@ -557,6 +570,16 @@ export class DelegateEngine {
 				}, attempt === MAX_OUTPUT_CAPTURE_ATTEMPTS ? "warn" : "trace");
 				const sessionCompletion = await this.capturePiSessionCompletion(runtime, relayMessageId);
 				if (sessionCompletion) return sessionCompletion;
+				if (isInterruptedChildOutput(output)) {
+					await debug.log("leaf.output.interrupted", {
+						communicationId: runtime.communicationId,
+						agent: runtime.agent,
+						attempt,
+						length: output.length,
+						sha256: hashDebugText(output),
+					}, "warn");
+					return { completion: interruptedCompletionContract(), attempts: attempt, source: "terminal" };
+				}
 				if (attempt < MAX_OUTPUT_CAPTURE_ATTEMPTS) {
 					const delay = runtime.deadlineAt === undefined ? OUTPUT_CAPTURE_RETRY_MS : Math.min(OUTPUT_CAPTURE_RETRY_MS, Math.max(1, runtime.deadlineAt - Date.now()));
 					await sleep(delay);

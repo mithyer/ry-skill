@@ -89,7 +89,7 @@ Pi uses its normal arguments.
 The default leaf pane policy is `new-tab`. After semantic `DONE`, the runtime
 creates a non-focused tab named `closed-pane-<communicationId>` and moves the
 completed child pane there. `close` and `keep` are explicit alternatives.
-Incomplete outcomes preserve the pane when possible.
+Incomplete outcomes preserve the pane when possible. A recognized child-side cancellation marker such as `Conversation interrupted` is reported as `PARTIAL` with the child preserved; other missing or invalid completion contracts remain `ERROR`.
 
 #### Debug Logging
 

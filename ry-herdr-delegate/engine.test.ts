@@ -178,6 +178,35 @@ test("DelegateEngine classifies a Herdr command timeout as PARTIAL and preserves
 	}
 });
 
+/** Verifies a user-cancelled child is incomplete work, not a semantic task ERROR. */
+test("DelegateEngine classifies a manually interrupted child as PARTIAL and preserves the pane", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-interrupted-"));
+	try {
+		const gateway = new FakeGateway("Conversation interrupted\n› Write tests for @filename", "idle");
+		const engine = new DelegateEngine({
+			gateway,
+			config: parseDelegateConfig({ version: 1 }),
+			communicationDirectory: join(root, "communications"),
+			id: () => "interrupted-child",
+			sleep: async () => {},
+		});
+		const result = await engine.run({ action: "delegate", task: "write tests", role: "worker" }, {
+			cwd: "/tmp/project",
+			workspaceId: "w-test",
+			sourcePaneId: "w-test:p1",
+		});
+		assert.equal(result.status, "PARTIAL");
+		assert.match(result.error ?? "", /interrupted/i);
+		assert.equal(gateway.calls.includes("move"), false);
+		assert.equal(gateway.calls.includes("close"), false);
+		const events = (await readEventLog(result.communicationFile)).events.map(({ event }) => event);
+		const resultEvent = events.find((event) => event.type === "result");
+		assert.equal(resultEvent?.payload.status, "PARTIAL");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 /** Verifies every external child receives the literal semantic completion vocabulary. */
 test("buildRelayEnvelope states the exact completion contract", () => {
 	const relay = buildRelayEnvelope("/tmp/task.jsonl", 2, 2, 1, "msg-contract");
