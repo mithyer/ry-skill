@@ -284,6 +284,46 @@ function renderPipelineUi(ctx: ExtensionContext, progress: PipelineProgress): vo
 	ctx.ui.setWidget(pipelineUiSurfaceKey(ctx, progress.state.pipelineId, PIPELINE_UI_WIDGET_PREFIX), formatPipelineUi(progress));
 }
 
+/** Direct-leaf state used by the parent Pi status and widget surfaces. */
+interface DirectUiDetails {
+	/** Semantic or transport status shown to the parent user. */
+	status: string;
+	/** External agent target, when the runtime has resolved one. */
+	agent?: string;
+	/** Configured role used before the external agent is resolved. */
+	role?: string;
+	/** Child Herdr pane, when the runtime has created one. */
+	paneId?: string;
+	/** Sanitized completion summary shown after the child settles. */
+	summary?: string;
+	/** Redacted error text shown for a failed request. */
+	error?: string;
+}
+
+/** Returns a parent-session-isolated key for one direct-leaf UI surface. */
+function directUiSurfaceKey(ctx: ExtensionContext, prefix: string): string {
+	const sessionFile = ctx.sessionManager?.getSessionFile?.() ?? "ephemeral";
+	return `${prefix}:${sessionFile}:direct`;
+}
+
+/** Renders direct leaf progress in the parent pane without exposing paths or exact sessions. */
+function renderDirectDelegateUi(ctx: ExtensionContext, details: DirectUiDetails): void {
+	if (ctx.mode !== "tui") return;
+	const statusKey = directUiSurfaceKey(ctx, PIPELINE_UI_STATUS_PREFIX);
+	const widgetKey = directUiSurfaceKey(ctx, "ry-herdr-delegate-direct");
+	const agent = details.agent ?? details.role;
+	const statusText = agent ? `Herdr delegate · ${details.status} · ${agent}` : `Herdr delegate · ${details.status}`;
+	const lines = [
+		`Herdr delegate · ${details.status}`,
+		agent ? `Agent: ${agent}` : undefined,
+		details.paneId ? `Pane: ${details.paneId}` : undefined,
+		details.summary ? `Summary: ${details.summary}` : undefined,
+		details.error ? `Error: ${details.error}` : undefined,
+	].filter((line): line is string => line !== undefined);
+	ctx.ui.setStatus(statusKey, statusText);
+	ctx.ui.setWidget(widgetKey, lines);
+}
+
 /** Builds a stable monitor key that prevents duplicate timers for one parent pipeline. */
 function pipelineUiMonitorKey(ctx: ExtensionContext, pipelineId: string): string {
 	return `${ctx.cwd}:${ctx.sessionManager.getSessionFile() ?? "ephemeral"}:${pipelineId}`;
@@ -355,6 +395,9 @@ export async function executeDelegateTool(
 		configFile: GLOBAL_CONFIG_PATH,
 	});
 	return withDebugLogger(logger, async () => {
+		if (params.action === "delegate") {
+			renderDirectDelegateUi(ctx, { status: "RUNNING", role: params.role, agent: params.agent });
+		}
 		await debug.log("tool.request.start", {
 			action: params.action,
 			cwd: params.cwd ?? ctx.cwd,
@@ -367,12 +410,24 @@ export async function executeDelegateTool(
 		});
 		try {
 			const result = await executeDelegateToolWithConfig(params, ctx, signal, config);
+			if (params.action === "delegate" && result.details) {
+				renderDirectDelegateUi(ctx, {
+					status: result.details.status,
+					agent: result.details.result?.agent,
+					paneId: result.details.result?.paneId,
+					summary: result.details.result?.completion?.summary,
+					error: result.details.error,
+				});
+			}
 			if (params.action === "pipeline" && result.details?.submission?.pipelineId && workspaceId && result.details.status !== "ERROR") {
 				startPipelineUiMonitor(ctx, config, workspaceId, result.details.submission.pipelineId);
 			}
 			await debug.log("tool.request.result", { action: params.action, status: result.details?.status, communicationFile: result.details?.communicationFile });
 			return result;
 		} catch (error) {
+			if (params.action === "delegate") {
+				renderDirectDelegateUi(ctx, { status: "ERROR", role: params.role, agent: params.agent, error: error instanceof Error ? error.message : String(error) });
+			}
 			await debug.log("tool.request.error", { action: params.action, error: debugError(error) });
 			throw error;
 		}
@@ -421,10 +476,20 @@ async function runDirectDelegate(
 ): Promise<void> {
 	ctx.ui.setWorkingMessage("Running Herdr delegate...");
 	ctx.ui.setWorkingVisible(true);
+	renderDirectDelegateUi(ctx, { status: "RUNNING", role: overrides.role, agent: overrides.agent });
 	try {
 		const result = await executor({ action: "delegate", task, role: overrides.role, agent: overrides.agent }, ctx, ctx.signal);
+		const details = result.details;
+		renderDirectDelegateUi(ctx, {
+			status: details?.status ?? "UNKNOWN",
+			agent: details?.result?.agent ?? overrides.agent,
+			paneId: details?.result?.paneId,
+			summary: details?.result?.completion?.summary,
+			error: details?.error,
+		});
 		ctx.ui.notify(formatDelegateNotification(result), delegateNotificationType(result));
 	} catch (error) {
+		renderDirectDelegateUi(ctx, { status: "ERROR", role: overrides.role, agent: overrides.agent, error: error instanceof Error ? error.message : String(error) });
 		ctx.ui.notify(`ry_herdr_delegate_tool: ERROR\n${error instanceof Error ? error.message : String(error)}`, "error");
 	} finally {
 		ctx.ui.setWorkingVisible(false);

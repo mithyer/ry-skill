@@ -21,7 +21,7 @@ import {
 } from "./tool.ts";
 
 /** Builds the smallest UI surface needed by direct command and input-handler tests. */
-function makeContext(idle = true): ExtensionContext {
+function makeContext(idle = true, statusCalls: string[] = [], widgetCalls: string[][] = []): ExtensionContext {
 	return {
 		mode: "tui",
 		cwd: "/tmp/project",
@@ -31,6 +31,8 @@ function makeContext(idle = true): ExtensionContext {
 			notify: () => undefined,
 			setWorkingMessage: () => undefined,
 			setWorkingVisible: () => undefined,
+			setStatus: (_key: string, text: string) => { statusCalls.push(text); },
+			setWidget: (_key: string, lines: string[]) => { widgetCalls.push(lines); },
 		},
 	} as unknown as ExtensionContext;
 }
@@ -121,6 +123,34 @@ test("createAutomaticDelegateInputHandler executes an actionable prompt", async 
 	assert.equal(calls[0].task, event.text);
 });
 
+/** Verifies automatic Claude routing renders the resolved external child status in the parent UI. */
+test("createAutomaticDelegateInputHandler displays the resolved Claude agent status", async () => {
+	const statuses: string[] = [];
+	const widgets: string[][] = [];
+	const executor = async (): Promise<AgentToolResult<DelegateToolDetails>> => ({
+		content: [{ type: "text", text: "DONE" }],
+		details: {
+			status: "DONE",
+			result: {
+				status: "DONE",
+				communicationId: "communication-claude",
+				communicationFile: "/private/communication-claude.jsonl",
+				agent: "claude-child",
+				paneId: "w-test:p2",
+				completion: { status: "DONE", summary: "Claude read-only validation complete" },
+			},
+		},
+	});
+	const handler = createAutomaticDelegateInputHandler(executor);
+	const result = await handler({ type: "input", text: "请使用 Claude 审查这次修改", source: "interactive" }, makeContext(true, statuses, widgets));
+	assert.deepEqual(result, { action: "handled" });
+	assert.deepEqual(statuses, ["Herdr delegate · RUNNING · claude", "Herdr delegate · DONE · claude-child"]);
+	assert.deepEqual(widgets, [
+		["Herdr delegate · RUNNING", "Agent: claude"],
+		["Herdr delegate · DONE", "Agent: claude-child", "Pane: w-test:p2", "Summary: Claude read-only validation complete"],
+	]);
+});
+
 /** Verifies incidental prompts, slash commands, and busy sessions remain available to normal Pi handling. */
 test("createAutomaticDelegateInputHandler does not intercept non-direct prompts", async () => {
 	const calls: DelegateToolParams[] = [];
@@ -138,14 +168,18 @@ test("createAutomaticDelegateInputHandler does not intercept non-direct prompts"
 });
 
 /** Verifies the slash command passes its argument to the delegate leaf instead of showing a status-only notice. */
-test("createDelegateCommandHandler executes the supplied task", async () => {
+test("createDelegateCommandHandler executes the supplied task and updates direct status", async () => {
 	const calls: DelegateToolParams[] = [];
+	const statuses: string[] = [];
+	const widgets: string[][] = [];
 	const handler = createDelegateCommandHandler(makeExecutor(calls));
-	await handler("fix the requested issue", makeContext() as ExtensionCommandContext);
+	await handler("fix the requested issue", makeContext(true, statuses, widgets) as ExtensionCommandContext);
 	assert.equal(calls.length, 1);
 	assert.equal(calls[0].action, "delegate");
 	assert.equal(calls[0].role, "delegate");
 	assert.equal(calls[0].task, "fix the requested issue");
+	assert.deepEqual(statuses, ["Herdr delegate · RUNNING · delegate", "Herdr delegate · DONE"]);
+	assert.deepEqual(widgets, [["Herdr delegate · RUNNING", "Agent: delegate"], ["Herdr delegate · DONE"]]);
 });
 
 /** Verifies the extension registers both executable direct-entry surfaces. */

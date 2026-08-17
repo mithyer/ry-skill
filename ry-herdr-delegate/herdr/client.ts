@@ -45,6 +45,12 @@ const AGENT_START_ATTEMPTS = 30;
 /** Delay between explicit `agent_pane_busy` startup retries. */
 const AGENT_START_RETRY_MS = 100;
 
+/** Maximum attempts while Herdr asynchronously promotes a settled agent into a readable terminal snapshot. */
+const AGENT_READ_ATTEMPTS = 5;
+
+/** Delay between explicit `agent_not_idle` terminal-read retries. */
+const AGENT_READ_RETRY_MS = 100;
+
 /** Maximum attempts while Herdr publishes exact session metadata after agent startup. */
 const AGENT_SESSION_ATTEMPTS = 30;
 
@@ -153,6 +159,11 @@ function herdrErrorCode(error: unknown): string | undefined {
 /** Returns whether Herdr has not yet promoted a new split pane into an agent-startable shell. */
 function isTransientAgentPaneBusy(error: unknown): boolean {
 	return herdrErrorCode(error) === "agent_pane_busy";
+}
+
+/** Returns whether Herdr has not yet made a settled agent terminal readable. */
+function isTransientAgentRead(error: unknown): boolean {
+	return herdrErrorCode(error) === "agent_not_idle";
 }
 
 /** Normalizes a raw Herdr agent session object. */
@@ -561,7 +572,24 @@ export class HerdrCliGateway implements HerdrGateway {
 	 * @returns Raw terminal output text.
 	 */
 	async readAgent(target: string, signal?: AbortSignal): Promise<HerdrAgentOutput> {
-		const result = await this.run(["agent", "read", target, "--source", "recent-unwrapped", "--lines", "500", "--format", "text"], signal);
+		const args = ["agent", "read", target, "--source", "recent-unwrapped", "--lines", "500", "--format", "text"];
+		let result: { stdout: string; stderr: string } | undefined;
+		for (let attempt = 1; attempt <= AGENT_READ_ATTEMPTS; attempt += 1) {
+			try {
+				result = await this.run(args, signal);
+				break;
+			} catch (error) {
+				if (!isTransientAgentRead(error) || attempt === AGENT_READ_ATTEMPTS) throw error;
+				await this.debugLogger.log("herdr.agent.read.retry", {
+					target,
+					attempt,
+					maxAttempts: AGENT_READ_ATTEMPTS,
+					retryMs: AGENT_READ_RETRY_MS,
+				});
+				await this.sleep(AGENT_READ_RETRY_MS);
+			}
+		}
+		if (!result) throw new Error("Herdr agent read retry loop ended unexpectedly");
 		const trimmed = result.stdout.trim();
 		if (!trimmed.startsWith("{")) return { text: result.stdout };
 		try {

@@ -16,7 +16,7 @@ interface SpawnCall {
 }
 
 /** Creates a minimal child-process double that emits output and close events. */
-function fakeChild(output: string, code: number | null = 0, terminationSignal: NodeJS.Signals | null = null): ChildProcess {
+function fakeChild(output: string, code: number | null = 0, terminationSignal: NodeJS.Signals | null = null, errorOutput = ""): ChildProcess {
 	const child = new EventEmitter() as EventEmitter & {
 		stdout: EventEmitter;
 		stderr: EventEmitter;
@@ -25,6 +25,7 @@ function fakeChild(output: string, code: number | null = 0, terminationSignal: N
 	child.stderr = new EventEmitter();
 	setImmediate(() => {
 		if (output) child.stdout.emit("data", output);
+		if (errorOutput) child.stderr.emit("data", errorOutput);
 		child.emit("close", code, terminationSignal);
 	});
 	return child as unknown as ChildProcess;
@@ -197,6 +198,37 @@ test("HerdrCliGateway retries transient agent_pane_busy startup", async () => {
 	assert.deepEqual(delays, [100]);
 	assert.equal(calls.filter((call) => call.args[0] === "agent" && call.args[1] === "start").length, 2);
 });
+/** Verifies a transient Herdr terminal-read race is retried without changing the command boundary. */
+test("HerdrCliGateway retries transient agent_not_idle terminal reads", async () => {
+	const calls: SpawnCall[] = [];
+	const delays: number[] = [];
+	let readAttempts = 0;
+	const spawnProcess: SpawnProcess = (command, args, options) => {
+		calls.push({ command, args: [...args], options });
+		if (args[0] === "agent" && args[1] === "read") {
+			readAttempts += 1;
+			if (readAttempts === 1) {
+				return fakeChild("", 1, null, JSON.stringify({ error: { code: "agent_not_idle", message: "agent output is only readable while idle" } }));
+			}
+			return fakeChild("STATUS: DONE\nSUMMARY: refreshed terminal\nVALIDATION: read retry passed\n");
+		}
+		return fakeChild(JSON.stringify({ result: { ok: true } }));
+	};
+	const gateway = new HerdrCliGateway({
+		command: "herdr-test",
+		cwd: "/tmp/project",
+		spawnProcess,
+		sleep: async (milliseconds) => { delays.push(milliseconds); },
+	});
+
+	const output = await gateway.readAgent("worker-test");
+
+	assert.match(output.text, /SUMMARY: refreshed terminal/);
+	assert.equal(readAttempts, 2);
+	assert.deepEqual(delays, [100]);
+	assert.equal(calls.filter((call) => call.args[0] === "agent" && call.args[1] === "read").length, 2);
+});
+
 /** Verifies startup establishes a missing external session before the real relay can be sent. */
 test("HerdrCliGateway bootstraps delayed agent_session metadata", async () => {
 	const calls: SpawnCall[] = [];

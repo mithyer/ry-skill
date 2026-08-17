@@ -28,7 +28,7 @@ import type {
 const MAX_CONTINUATIONS = 3;
 
 /** Maximum terminal-output captures before reporting an incomplete child completion contract. */
-const MAX_OUTPUT_CAPTURE_ATTEMPTS = 20;
+const MAX_OUTPUT_CAPTURE_ATTEMPTS = 60;
 
 /** Delay between terminal-output rereads while Herdr refreshes a child TUI snapshot. */
 const OUTPUT_CAPTURE_RETRY_MS = 250;
