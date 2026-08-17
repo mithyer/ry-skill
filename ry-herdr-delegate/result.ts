@@ -3,10 +3,11 @@ import type { CompletionContract, SemanticStatus } from "./types.ts";
 /** Required headings in the child completion contract. */
 const REQUIRED_HEADINGS = ["STATUS", "SUMMARY", "VALIDATION"] as const;
 
-/** Extracts a single heading value from raw child terminal output, tolerating zero to two display characters before the heading. */
+/** Extracts the last matching heading so relay instructions do not outrank the child's final contract. */
 function readHeading(text: string, heading: string): string | undefined {
-	const pattern = new RegExp(`^[\\t ]*(?:[^\\r\\n]{1,2})?${heading}\\s*:\\s*(.+?)\\s*$`, "im");
-	return text.match(pattern)?.[1]?.trim();
+	const pattern = new RegExp(`^[\\t ]*(?:[^\\r\\n]{1,2})?${heading}\\s*:\\s*(.+?)\\s*$`, "gim");
+	const matches = [...text.matchAll(pattern)];
+	return matches.at(-1)?.[1]?.trim();
 }
 
 /** Normalizes a status heading and rejects statuses outside the runtime contract. */

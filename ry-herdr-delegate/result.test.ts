@@ -22,6 +22,18 @@ test("completion contract parsing distinguishes DONE from incomplete output", ()
 	assert.equal(arbitraryPrefixes.status, "DONE");
 	assert.equal(arbitraryPrefixes.summary, "rendered through arbitrary prefixes");
 	assert.equal(isSemanticDone(arbitraryPrefixes), true);
+	const relayHistory = parseCompletionContract([
+		"STATUS: DONE|BLOCKED|PARTIAL|ERROR",
+		"SUMMARY: <one-line result>",
+		"VALIDATION: <commands or checks performed>",
+		"• STATUS: DONE",
+		"SUMMARY: final child result",
+		"VALIDATION: final child validation",
+	].join("\n"));
+	assert.equal(relayHistory.status, "DONE");
+	assert.equal(relayHistory.summary, "final child result");
+	assert.equal(relayHistory.validation, "final child validation");
+	assert.equal(isSemanticDone(relayHistory), true);
 	assert.throws(() => parseCompletionContract("abcSTATUS: DONE\nSUMMARY: too many prefix characters\nVALIDATION: no files changed\n"), /STATUS/);
 	assert.equal(errorCompletionContract(new Error("bad")).status, "ERROR");
 	assert.throws(() => parseCompletionContract("STATUS: DONE\nSUMMARY: missing validation"), /VALIDATION/);
