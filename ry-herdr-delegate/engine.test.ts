@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
-import { DelegateEngine } from "./engine.ts";
+import { buildRelayEnvelope, DelegateEngine } from "./engine.ts";
 import { HerdrCommandError } from "./herdr/client.ts";
 import { parseDelegateConfig } from "./config.ts";
 import { readEventLog } from "./records.ts";
@@ -178,7 +178,16 @@ test("DelegateEngine classifies a Herdr command timeout as PARTIAL and preserves
 	}
 });
 
-/** Checks delayed Herdr terminal refreshes are reread without creating or prompting a new child. */
+/** Verifies every external child receives the literal semantic completion vocabulary. */
+test("buildRelayEnvelope states the exact completion contract", () => {
+	const relay = buildRelayEnvelope("/tmp/task.jsonl", 2, 2, 1, "msg-contract");
+	assert.match(relay, /STATUS: DONE\|BLOCKED\|PARTIAL\|ERROR/);
+	assert.match(relay, /SUMMARY: <one-line result>/);
+	assert.match(relay, /VALIDATION: <commands or checks performed>/);
+	assert.match(relay, /Use STATUS: DONE only when the task is complete and validated\./);
+});
+
+/** Verifies delayed Herdr terminal refreshes are reread without creating or prompting a new child. */
 test("DelegateEngine rereads a stale terminal snapshot before parsing the completion contract", async () => {
 	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-output-refresh-"));
 	try {

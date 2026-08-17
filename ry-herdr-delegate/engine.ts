@@ -137,7 +137,11 @@ export function buildRelayEnvelope(file: string, lineStart: number, lineEnd: num
 		`MESSAGE TYPE: ${messageType}`,
 		"",
 		"Read and parse this JSONL event before acting.",
-		"Return the required completion contract.",
+		"Return exactly these three headings, each on its own line:",
+		"STATUS: DONE|BLOCKED|PARTIAL|ERROR",
+		"SUMMARY: <one-line result>",
+		"VALIDATION: <commands or checks performed>",
+		"Use STATUS: DONE only when the task is complete and validated.",
 		"Do not delegate recursively.",
 	].join("\n");
 }
