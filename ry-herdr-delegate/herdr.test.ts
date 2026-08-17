@@ -296,6 +296,6 @@ test("HerdrCliGateway reports command timeouts", async () => {
 		return child as unknown as ChildProcess;
 	};
 	const gateway = new HerdrCliGateway({ cwd: "/tmp/project", timeoutMs: 5, spawnProcess });
-	await assert.rejects(gateway.getAgent("worker-test"), (error: unknown) => error instanceof HerdrCommandError && /timeout after 5ms/.test(error.message));
+	await assert.rejects(gateway.getAgent("worker-test"), (error: unknown) => error instanceof HerdrCommandError && /timeout after 5ms/.test(error.message) && error.timedOut === true);
 	assert.equal(aborted, true);
 });

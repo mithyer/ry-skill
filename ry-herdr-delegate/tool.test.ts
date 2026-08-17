@@ -16,6 +16,7 @@ import {
 	formatDelegateToolResult,
 	formatPipelineUi,
 	registerDelegateTool,
+	selectAgentForTask,
 	type DelegateToolDetails,
 	type DelegateToolParams,
 } from "./tool.ts";
@@ -105,6 +106,15 @@ test("detectAutomaticDelegateRequest routes actionable Codex and Claude prompts"
 	assert.equal(detectAutomaticDelegateRequest("请介绍一下 Claude"), undefined);
 });
 
+/** Verifies slash-command task intent selects a child profile instead of the delegate role default. */
+test("selectAgentForTask routes explicit, review, engineering, and general tasks", () => {
+	assert.equal(selectAgentForTask("用codex，修复分享图生成逻辑"), "codex");
+	assert.equal(selectAgentForTask("use Claude to review the requested change"), "claude");
+	assert.equal(selectAgentForTask("review the requested change"), "claude");
+	assert.equal(selectAgentForTask("修复登录失败并运行测试"), "codex");
+	assert.equal(selectAgentForTask("整理一下当前进度"), "pi");
+});
+
 /** Verifies automatic input handling directly invokes the selected agent and suppresses the model turn. */
 test("createAutomaticDelegateInputHandler executes an actionable prompt", async () => {
 	const calls: DelegateToolParams[] = [];
@@ -176,10 +186,12 @@ test("createDelegateCommandHandler executes the supplied task and updates direct
 	await handler("fix the requested issue", makeContext(true, statuses, widgets) as ExtensionCommandContext);
 	assert.equal(calls.length, 1);
 	assert.equal(calls[0].action, "delegate");
-	assert.equal(calls[0].role, "delegate");
+	assert.equal(calls[0].role, "worker");
+	assert.equal(calls[0].agent, "codex");
+	assert.equal(calls[0].timeoutMs, 600000);
 	assert.equal(calls[0].task, "fix the requested issue");
-	assert.deepEqual(statuses, ["Herdr delegate · RUNNING · delegate", "Herdr delegate · DONE"]);
-	assert.deepEqual(widgets, [["Herdr delegate · RUNNING", "Agent: delegate"], ["Herdr delegate · DONE"]]);
+	assert.deepEqual(statuses, ["Herdr delegate · RUNNING · codex", "Herdr delegate · DONE · codex"]);
+	assert.deepEqual(widgets, [["Herdr delegate · RUNNING", "Agent: codex"], ["Herdr delegate · DONE", "Agent: codex"]]);
 });
 
 /** Verifies the extension registers both executable direct-entry surfaces. */

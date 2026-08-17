@@ -489,12 +489,13 @@ export function redactDebugValue(value: unknown, key?: string): unknown {
 /** Converts thrown values into stable structured fields for debug events. */
 export function debugError(error: unknown): Record<string, unknown> {
 	if (error instanceof Error) {
-		const candidate = error as Error & { code?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown; args?: unknown };
+		const candidate = error as Error & { code?: unknown; signal?: unknown; timedOut?: unknown; stdout?: unknown; stderr?: unknown; args?: unknown };
 		return {
 			name: error.name,
 			message: error.message,
 			code: candidate.code,
 			signal: candidate.signal,
+			timedOut: candidate.timedOut,
 			args: Array.isArray(candidate.args) ? summarizeDebugArgs(candidate.args.filter((item): item is string => typeof item === "string")) : candidate.args,
 			stdout: typeof candidate.stdout === "string" ? summarizeDebugText(candidate.stdout) : candidate.stdout,
 			stderr: typeof candidate.stderr === "string" ? summarizeDebugText(candidate.stderr) : candidate.stderr,

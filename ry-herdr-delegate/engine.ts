@@ -242,6 +242,12 @@ function failureResult(runtime: LeafRuntime, status: SemanticStatus, error: unkn
 	};
 }
 
+/** Detects a Herdr command timeout without confusing it with a parent cancellation or agent failure. */
+function isHerdrCommandTimeout(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	return (error as { timedOut?: unknown }).timedOut === true;
+}
+
 /** Owns one leaf delegation transaction from event-log handoff through pane disposition. */
 export class DelegateEngine {
 	/** Injectable engine dependencies. */
@@ -468,9 +474,20 @@ export class DelegateEngine {
 			return await this.waitAndResolve(runtime, profile.timeoutMs, owner, messageId, operationSignal);
 		} catch (error) {
 			await debug.log("leaf.run.failed", { communicationId: runtime.communicationId, transaction: runtime.transaction, stageRole: runtime.stageRole, error: debugError(error) }, "error");
+			const commandTimedOut = isHerdrCommandTimeout(error);
+			if (commandTimedOut) {
+				// Herdr's local command timer can abort prompt --wait while the external child keeps working.
+				await appendEvent(communicationFile, event("checkpoint", owner, runtime, {
+					transportStatus: "unknown",
+					operation: "prompt",
+					accepted: "unknown",
+					error: error instanceof Error ? error.message : String(error),
+				}, undefined, runtime.session)).catch(() => undefined);
+			}
 			await appendEvent(communicationFile, event("error", owner, runtime, { error: error instanceof Error ? error.message : String(error) })).catch(() => undefined);
 			const deadlineExpired = runtime.deadlineAt !== undefined && Date.now() >= runtime.deadlineAt;
-			return failureResult(runtime, operationSignal.aborted || deadlineExpired ? "PARTIAL" : "ERROR", operationSignal.aborted || deadlineExpired ? "delegate stage operation was aborted" : error);
+			const unfinishedOperation = operationSignal.aborted || deadlineExpired || commandTimedOut;
+			return failureResult(runtime, unfinishedOperation ? "PARTIAL" : "ERROR", unfinishedOperation ? "delegate stage operation was aborted" : error);
 		} finally {
 			clearTimeout(deadlineTimer);
 			signal?.removeEventListener("abort", abortOperation);

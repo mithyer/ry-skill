@@ -95,6 +95,8 @@ export class HerdrCommandError extends HerdrCapabilityError {
 	readonly code: number | null;
 	/** Signal that ended the process, when any. */
 	readonly signal: NodeJS.Signals | null;
+	/** Whether the gateway's own command timer, rather than the parent signal, aborted the process. */
+	readonly timedOut: boolean;
 
 	/**
 	 * Creates a command failure with process termination details.
@@ -105,6 +107,7 @@ export class HerdrCommandError extends HerdrCapabilityError {
 	 * @param signal Process termination signal.
 	 * @param stdout Captured standard output.
 	 * @param stderr Captured standard error.
+	 * @param timedOut Whether the gateway command timer caused the abort.
 	 */
 	constructor(
 		message: string,
@@ -113,11 +116,13 @@ export class HerdrCommandError extends HerdrCapabilityError {
 		signal: NodeJS.Signals | null,
 		stdout: string,
 		stderr: string,
+		timedOut = false,
 	) {
 		super(message, args, stdout, stderr);
 		this.name = "HerdrCommandError";
 		this.code = code;
 		this.signal = signal;
+		this.timedOut = timedOut;
 	}
 }
 
@@ -348,7 +353,9 @@ export class HerdrCliGateway implements HerdrGateway {
 			let stdout = "";
 			let stderr = "";
 			let settled = false;
+			let timedOut = false;
 			const timer = setTimeout(() => {
+				timedOut = true;
 				void this.debugLogger.log("herdr.command.timeout", { command: this.command, args: debugArgs, timeoutMs, elapsedMs: Date.now() - startedAt });
 				controller.abort(new Error(`timeout after ${timeoutMs}ms`));
 			}, timeoutMs);
@@ -369,7 +376,7 @@ export class HerdrCliGateway implements HerdrGateway {
 					...(error ? { error: debugError(error) } : {}),
 				};
 				if (error) {
-					const wrapped = new HerdrCommandError(error.message, args, code, terminationSignal, stdout, stderr);
+					const wrapped = new HerdrCommandError(error.message, args, code, terminationSignal, stdout, stderr, timedOut);
 					void this.debugLogger.log("herdr.command.failed", details);
 					reject(wrapped);
 					return;

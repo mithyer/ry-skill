@@ -4,6 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { DelegateEngine } from "./engine.ts";
+import { HerdrCommandError } from "./herdr/client.ts";
 import { parseDelegateConfig } from "./config.ts";
 import { readEventLog } from "./records.ts";
 import type {
@@ -31,6 +32,8 @@ interface FakeGatewayOptions {
 	startedSession?: SessionIdentity;
 	/** Terminal snapshots returned sequentially to simulate Herdr's delayed TUI refresh. */
 	outputs?: readonly string[];
+	/** Error thrown by the simulated relay command. */
+	promptError?: Error;
 }
 
 /** Deterministic fake gateway for leaf engine tests. */
@@ -44,6 +47,7 @@ class FakeGateway implements HerdrGateway {
 	private outputIndex = 0;
 	private readonly closedTarget?: string;
 	private readonly startedSession?: SessionIdentity;
+	private readonly promptError?: Error;
 
 	/**
 	 * Creates a fake child lifecycle.
@@ -58,6 +62,7 @@ class FakeGateway implements HerdrGateway {
 		this.outputs = options.outputs;
 		this.closedTarget = options.closedTarget;
 		this.startedSession = options.startedSession;
+		this.promptError = options.promptError;
 		this.childSnapshot = {
 			agent: "worker-test",
 			status,
@@ -78,6 +83,7 @@ class FakeGateway implements HerdrGateway {
 	async prompt(input: PromptInput): Promise<HerdrAgentSnapshot | undefined> {
 		this.calls.push("prompt");
 		this.lastPrompt = input;
+		if (this.promptError) throw this.promptError;
 		return this.childSnapshot;
 	}
 	async waitFor(_input: WaitInput): Promise<HerdrAgentSnapshot> { this.calls.push("wait"); return this.childSnapshot; }
@@ -141,6 +147,32 @@ test("DelegateEngine completes a leaf only after exact checkpoint and DONE contr
 		const events = (await readEventLog(result.communicationFile)).events;
 		assert.equal(events.at(-1)?.event.type, "pane-disposition");
 		assert.equal(events.find(({ event }) => event.type === "result")?.event.payload.status, "DONE");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+
+/** Verifies Herdr's own command timeout is an unfinished external turn, not a semantic ERROR. */
+test("DelegateEngine classifies a Herdr command timeout as PARTIAL and preserves the child", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-command-timeout-"));
+	try {
+		const timeout = new HerdrCommandError("The operation was aborted", ["agent", "prompt"], null, null, "", "", true);
+		const gateway = new FakeGateway("STATUS: DONE\nSUMMARY: late completion\nVALIDATION: late validation", "working", true, { promptError: timeout });
+		const engine = await createEngine(gateway, root);
+		const result = await engine.run({ action: "delegate", task: "run a slow build", role: "worker" }, {
+			cwd: "/tmp/project",
+			workspaceId: "w-test",
+			sourcePaneId: "w-test:p1",
+		});
+		assert.equal(result.status, "PARTIAL");
+		assert.equal(result.error, "delegate stage operation was aborted");
+		assert.deepEqual(gateway.calls, ["split", "start", "prompt"]);
+		const events = (await readEventLog(result.communicationFile)).events.map(({ event }) => event);
+		const promptCheckpoint = events.find((event) => event.type === "checkpoint" && event.payload.operation === "prompt");
+		assert.equal(promptCheckpoint?.payload.operation, "prompt");
+		assert.equal(promptCheckpoint?.payload.accepted, "unknown");
+		assert.equal(events.at(-1)?.type, "error");
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

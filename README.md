@@ -145,7 +145,11 @@ The extension does not silently fall back to the old skill, an external
 
 `/ry-herdr-delegate <task>` executes one leaf task through
 `ry_herdr_delegate_tool` and reports its structured status. It is an execution
-command, not a status-only command.
+command, not a status-only command. Explicit directives such as `用codex` or
+`使用 Claude` are honored; otherwise review or research tasks use Claude,
+implementation and validation tasks use Codex, and other tasks use Pi. Manual
+slash tasks selected for an external worker receive a 10-minute command budget
+so long-running builds are not cut off by the ordinary 180-second default.
 
 Before the model loop, the extension also detects an explicit actionable agent
 directive such as `请使用 codex 修复这个问题`, `使用 Claude 审查这次修改`, or
@@ -154,8 +158,9 @@ the selected external agent with the `worker` profile and marks the input as
 handled, so the model does not execute the same request a second time.
 
 Incidental mentions such as `Codex 和 Claude 有什么区别？`, negative requests
-such as `不要使用 codex`, slash commands, non-TUI input, and prompts received
-while Pi is already busy are left to normal Pi handling.
+such as `不要使用 codex`, streaming/non-TUI input, and prompts received while
+Pi is already busy are left to normal Pi handling; the registered slash command
+is handled by the direct command path above.
 
 ### Zero-history Invocation
 

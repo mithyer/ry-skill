@@ -23,7 +23,7 @@ import { HerdrCliGateway } from "./herdr/client.ts";
 import { PipelineCoordinator } from "./pipeline-coordinator.ts";
 import { canonicalCwdResourceKey, WorkspaceReservationLedger } from "./concurrency.ts";
 import { PipelineStore, type PipelineProgress } from "./pipeline.ts";
-import type { DelegateResult, PipelineControlResult, PipelineSubmission, SessionIdentity } from "./types.ts";
+import type { AgentKind, DelegateResult, PipelineControlResult, PipelineSubmission, SessionIdentity } from "./types.ts";
 
 /** Structured action names exposed by the project-owned runtime. */
 const ACTIONS = ["delegate", "pipeline", "pipeline.status", "pipeline.answer", "pipeline.approve", "pipeline.reject", "pipeline.stop", "pipeline.coordinator", "recover", "pipeline.recover"] as const;
@@ -94,6 +94,9 @@ export interface DelegateToolDetails {
 /** Agents that can be selected by an explicit natural-language delegation directive. */
 export type AutomaticDelegateAgent = "codex" | "claude";
 
+/** Agents selected from a slash-command task when the user did not explicitly name one. */
+export type TaskDelegateAgent = AgentKind;
+
 /** Parsed direct-delegation request from an actionable user prompt. */
 export interface AutomaticDelegateRequest {
 	/** External agent explicitly selected by the user. */
@@ -111,6 +114,12 @@ const AUTOMATIC_AGENT_NEGATION = /(?:不要|不用|不使用|无需|without|don'
 /** Minimal work-intent vocabulary required before automatic routing is allowed. */
 const AUTOMATIC_WORK_INTENT = /(?:帮我|帮忙|处理|解决|修复|实现|修改|编写|重构|排查|调试|审查|评审|研究|调查|执行|运行|测试|部署|查看|检查|fix|implement|change|write|refactor|debug|review|research|investigate|execute|run|test|build|deploy|check|inspect)/iu;
 
+/** Review and investigation work benefits most from Claude's analytical profile. */
+const CLAUDE_TASK_INTENT = /(?:审查|评审|review|audit|分析|analy[sz]e|研究|调查|research|investigate)/iu;
+
+/** Implementation and validation work benefits most from Codex's engineering profile. */
+const CODEX_TASK_INTENT = /(?:处理|解决|修复|实现|修改|编写|重构|排查|调试|执行|运行|测试|部署|查看|检查|fix|implement|change|write|refactor|debug|execute|run|test|build|deploy|check|inspect)/iu;
+
 /**
  * Detects an explicit Codex/Claude work directive without treating incidental mentions as execution requests.
  * @param text Raw user prompt received before the agent loop.
@@ -124,6 +133,24 @@ export function detectAutomaticDelegateRequest(text: string): AutomaticDelegateR
 	const agent = match?.[1]?.toLowerCase();
 	if (agent !== "codex" && agent !== "claude") return undefined;
 	return { agent, task };
+}
+
+/** Maximum time a manually submitted slash task may wait for a long external build or validation. */
+const SLASH_COMMAND_TIMEOUT_MS = 600_000;
+
+/**
+ * Selects a child profile from task intent when a slash-command user did not name an agent.
+ * @param task Slash-command task text.
+ * @returns The agent profile appropriate for the detected task class.
+ * TEST:ry-herdr-delegate/tool.test.ts[selectAgentForTask]
+ */
+export function selectAgentForTask(task: string): TaskDelegateAgent {
+	if (AUTOMATIC_AGENT_NEGATION.test(task)) return "pi";
+	const explicitAgent = task.match(AUTOMATIC_AGENT_DIRECTIVE)?.[1]?.toLowerCase();
+	if (explicitAgent === "codex" || explicitAgent === "claude") return explicitAgent;
+	if (CLAUDE_TASK_INTENT.test(task)) return "claude";
+	if (CODEX_TASK_INTENT.test(task)) return "codex";
+	return "pi";
 }
 
 /** Global configuration path used by the extension and debug context. */
@@ -438,8 +465,17 @@ export async function executeDelegateTool(
 interface DirectDelegateOverrides {
 	/** Configured runtime role used for timeout/profile resolution. */
 	role: string;
-	/** Optional explicit external agent selected by the user. */
-	agent?: AutomaticDelegateAgent;
+	/** Optional explicit external agent selected by the user or task classifier. */
+	agent?: TaskDelegateAgent;
+	/** Optional command-specific timeout override. */
+	timeoutMs?: number;
+}
+
+/** Resolves slash-command task routing and its long-running manual-task budget. */
+function selectSlashDelegateOverrides(task: string): DirectDelegateOverrides {
+	const agent = selectAgentForTask(task);
+	if (agent === "pi") return { role: "delegate", agent };
+	return { role: "worker", agent, timeoutMs: SLASH_COMMAND_TIMEOUT_MS };
 }
 
 type DelegateExecutor = (
@@ -478,7 +514,7 @@ async function runDirectDelegate(
 	ctx.ui.setWorkingVisible(true);
 	renderDirectDelegateUi(ctx, { status: "RUNNING", role: overrides.role, agent: overrides.agent });
 	try {
-		const result = await executor({ action: "delegate", task, role: overrides.role, agent: overrides.agent }, ctx, ctx.signal);
+		const result = await executor({ action: "delegate", task, role: overrides.role, agent: overrides.agent, timeoutMs: overrides.timeoutMs }, ctx, ctx.signal);
 		const details = result.details;
 		renderDirectDelegateUi(ctx, {
 			status: details?.status ?? "UNKNOWN",
@@ -510,7 +546,7 @@ export function createDelegateCommandHandler(executor: DelegateExecutor = execut
 			ctx.ui.notify("Usage: /ry-herdr-delegate <task>", "warning");
 			return;
 		}
-		await runDirectDelegate(task, ctx, { role: "delegate" }, executor);
+		await runDirectDelegate(task, ctx, selectSlashDelegateOverrides(task), executor);
 	};
 }
 
