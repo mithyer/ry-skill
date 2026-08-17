@@ -1,13 +1,29 @@
 import type { CompletionContract, SemanticStatus } from "./types.ts";
 
-/** Required headings in the child completion contract. */
-const REQUIRED_HEADINGS = ["STATUS", "SUMMARY", "VALIDATION"] as const;
+/** One terminal heading match retained while selecting a coherent final completion block. */
+interface HeadingMatch {
+	/** Trimmed heading value. */
+	value: string;
+	/** Match start offset in the captured terminal text. */
+	index: number;
+	/** Match end offset used as the completion-block anchor. */
+	end: number;
+}
 
-/** Extracts the last matching heading so relay instructions do not outrank the child's final contract. */
-function readHeading(text: string, heading: string): string | undefined {
+/** Finds all display-tolerant heading matches in terminal order. */
+function readHeadingMatches(text: string, heading: string): HeadingMatch[] {
 	const pattern = new RegExp(`^[\\t ]*(?:[^\\r\\n]{1,2})?${heading}\\s*:\\s*(.+?)\\s*$`, "gim");
-	const matches = [...text.matchAll(pattern)];
-	return matches.at(-1)?.[1]?.trim();
+	return [...text.matchAll(pattern)].flatMap((match) => {
+		const value = match[1]?.trim();
+		const index = match.index;
+		if (!value || index === undefined) return [];
+		return [{ value, index, end: index + match[0].length }];
+	});
+}
+
+/** Reads the first heading after a completion-block anchor. */
+function readHeading(text: string, heading: string, startAt = 0): string | undefined {
+	return readHeadingMatches(text, heading).find((match) => match.index >= startAt)?.value;
 }
 
 /** Normalizes a status heading and rejects statuses outside the runtime contract. */
@@ -16,22 +32,35 @@ function readStatus(value: string | undefined): SemanticStatus {
 	throw new Error("Child completion contract must contain STATUS: DONE|BLOCKED|PARTIAL|ERROR");
 }
 
-/** Parses and validates the required child completion contract headings. */
+/** Parses and validates one coherent completion block after the latest legal STATUS heading. */
 export function parseCompletionContract(text: string): CompletionContract {
-	for (const heading of REQUIRED_HEADINGS) {
-		if (!readHeading(text, heading)) throw new Error(`Child completion contract is missing ${heading}`);
+	const statusMatches = readHeadingMatches(text, "STATUS");
+	let statusMatch: HeadingMatch | undefined;
+	for (let index = statusMatches.length - 1; index >= 0; index -= 1) {
+		try {
+			readStatus(statusMatches[index]!.value);
+			statusMatch = statusMatches[index];
+			break;
+		} catch {
+			// Relay examples such as STATUS: DONE|BLOCKED|PARTIAL|ERROR are not child results.
+		}
 	}
+	if (!statusMatch) throw new Error("Child completion contract must contain STATUS: DONE|BLOCKED|PARTIAL|ERROR");
+	const summary = readHeading(text, "SUMMARY", statusMatch.end);
+	const validation = readHeading(text, "VALIDATION", statusMatch.end);
+	if (!summary) throw new Error("Child completion contract is missing SUMMARY");
+	if (!validation) throw new Error("Child completion contract is missing VALIDATION");
 	return {
-		status: readStatus(readHeading(text, "STATUS")),
-		pipelineStage: readHeading(text, "PIPELINE STAGE"),
-		summary: readHeading(text, "SUMMARY"),
-		changedFiles: readHeading(text, "CHANGED FILES"),
-		validation: readHeading(text, "VALIDATION"),
-		risks: readHeading(text, "RISKS / OPEN DECISIONS"),
-		sources: readHeading(text, "SOURCES"),
-		agentSession: readHeading(text, "AGENT SESSION"),
-		recoveryCommand: readHeading(text, "RECOVERY COMMAND"),
-		recoverySemantics: readHeading(text, "RECOVERY SEMANTICS"),
+		status: readStatus(statusMatch.value),
+		pipelineStage: readHeading(text, "PIPELINE STAGE", statusMatch.end),
+		summary,
+		changedFiles: readHeading(text, "CHANGED FILES", statusMatch.end),
+		validation,
+		risks: readHeading(text, "RISKS / OPEN DECISIONS", statusMatch.end),
+		sources: readHeading(text, "SOURCES", statusMatch.end),
+		agentSession: readHeading(text, "AGENT SESSION", statusMatch.end),
+		recoveryCommand: readHeading(text, "RECOVERY COMMAND", statusMatch.end),
+		recoverySemantics: readHeading(text, "RECOVERY SEMANTICS", statusMatch.end),
 	};
 }
 

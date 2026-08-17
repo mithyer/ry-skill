@@ -29,6 +29,9 @@ test("completion contract parsing distinguishes DONE from incomplete output", ()
 		"• STATUS: DONE",
 		"SUMMARY: final child result",
 		"VALIDATION: final child validation",
+		"STATUS: DONE|BLOCKED|PARTIAL|ERROR",
+		"SUMMARY: <one-line result>",
+		"VALIDATION: <commands or checks performed>",
 	].join("\n"));
 	assert.equal(relayHistory.status, "DONE");
 	assert.equal(relayHistory.summary, "final child result");
