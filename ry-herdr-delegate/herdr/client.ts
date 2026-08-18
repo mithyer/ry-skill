@@ -97,6 +97,10 @@ export class HerdrCommandError extends HerdrCapabilityError {
 	readonly signal: NodeJS.Signals | null;
 	/** Whether the gateway's own command timer, rather than the parent signal, aborted the process. */
 	readonly timedOut: boolean;
+	/** Structured Herdr error code when the CLI returned one. */
+	readonly herdrCode?: string;
+	/** Delivery classification when the gateway can prove the request was not sent. */
+	readonly deliveryState: "NOT_SENT" | "UNKNOWN";
 
 	/**
 	 * Creates a command failure with process termination details.
@@ -117,12 +121,16 @@ export class HerdrCommandError extends HerdrCapabilityError {
 		stdout: string,
 		stderr: string,
 		timedOut = false,
+		herdrCode?: string,
+		deliveryState: "NOT_SENT" | "UNKNOWN" = "UNKNOWN",
 	) {
 		super(message, args, stdout, stderr);
 		this.name = "HerdrCommandError";
 		this.code = code;
 		this.signal = signal;
 		this.timedOut = timedOut;
+		this.herdrCode = herdrCode;
+		this.deliveryState = deliveryState;
 	}
 }
 
@@ -146,19 +154,24 @@ function requiredString(record: Record<string, unknown>, keys: readonly string[]
 	throw new HerdrCapabilityError(`Herdr response is missing ${description}`, keys);
 }
 
-/** Extracts Herdr's structured error code without matching arbitrary diagnostic text. */
-function herdrErrorCode(error: unknown): string | undefined {
-	if (!(error instanceof HerdrCommandError)) return undefined;
-	for (const candidate of [error.stderr, error.stdout]) {
+/** Extracts Herdr's structured error code from captured command output. */
+function extractHerdrErrorCode(stdout: string, stderr: string): string | undefined {
+	for (const candidate of [stderr, stdout]) {
 		try {
 			const outer = asRecord(JSON.parse(candidate));
 			const nested = asRecord(outer?.error);
 			if (typeof nested?.code === "string") return nested.code;
 		} catch {
-			// A malformed error payload is not eligible for retry.
+			// A malformed error payload is not eligible for structured classification.
 		}
 	}
 	return undefined;
+}
+
+/** Extracts Herdr's structured error code without matching arbitrary diagnostic text. */
+function herdrErrorCode(error: unknown): string | undefined {
+	if (!(error instanceof HerdrCommandError)) return undefined;
+	return error.herdrCode ?? extractHerdrErrorCode(error.stdout, error.stderr);
 }
 
 /** Returns whether Herdr has not yet promoted a new split pane into an agent-startable shell. */
@@ -192,7 +205,7 @@ function normalizeAgent(value: unknown, fallbackTarget?: string): HerdrAgentSnap
 	if (!agent) throw new HerdrCapabilityError("Herdr agent response is missing agent", []);
 	const statusValue = record.agent_status ?? record.status;
 	const status: AgentTransportStatus =
-		statusValue === "working" || statusValue === "blocked" || statusValue === "idle" || statusValue === "done" || statusValue === "unknown"
+		statusValue === "working" || statusValue === "blocked" || statusValue === "idle" || statusValue === "done" || statusValue === "unknown" || statusValue === "closed"
 			? statusValue
 			: "unknown";
 	const paneId = record.pane_id ?? record.paneId;
@@ -345,7 +358,7 @@ export class HerdrCliGateway implements HerdrGateway {
 				void this.debugLogger.log("herdr.command.spawned", { command: this.command, args: debugArgs, cwd: this.cwd, elapsedMs: Date.now() - startedAt });
 			} catch (error) {
 				signal?.removeEventListener("abort", abortFromParent);
-				const wrapped = new HerdrCommandError(`Unable to start ${describeCommand(this.command, args)}: ${String(error)}`, args, null, null, "", "");
+				const wrapped = new HerdrCommandError(`Unable to start ${describeCommand(this.command, args)}: ${String(error)}`, args, null, null, "", "", false, undefined, "NOT_SENT");
 				void this.debugLogger.log("herdr.command.spawn-error", { command: this.command, args: debugArgs, elapsedMs: Date.now() - startedAt, error: debugError(wrapped) });
 				reject(wrapped);
 				return;
@@ -376,13 +389,15 @@ export class HerdrCliGateway implements HerdrGateway {
 					...(error ? { error: debugError(error) } : {}),
 				};
 				if (error) {
-					const wrapped = new HerdrCommandError(error.message, args, code, terminationSignal, stdout, stderr, timedOut);
+					const herdrCode = extractHerdrErrorCode(stdout, stderr);
+					const wrapped = new HerdrCommandError(error.message, args, code, terminationSignal, stdout, stderr, timedOut, herdrCode, "UNKNOWN");
 					void this.debugLogger.log("herdr.command.failed", details);
 					reject(wrapped);
 					return;
 				}
 				if (code !== 0) {
-					const wrapped = new HerdrCommandError(`${describeCommand(this.command, args)} failed: ${stderr.trim() || stdout.trim() || `exit code ${code}`}`, args, code, terminationSignal, stdout, stderr);
+					const herdrCode = extractHerdrErrorCode(stdout, stderr);
+					const wrapped = new HerdrCommandError(`${describeCommand(this.command, args)} failed: ${stderr.trim() || stdout.trim() || `exit code ${code}`}`, args, code, terminationSignal, stdout, stderr, false, herdrCode, "UNKNOWN");
 					void this.debugLogger.log("herdr.command.failed", { ...details, error: debugError(wrapped) });
 					reject(wrapped);
 					return;

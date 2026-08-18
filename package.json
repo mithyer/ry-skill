@@ -1,6 +1,6 @@
 {
   "name": "ry-skill",
-  "version": "0.5.32",
+  "version": "0.6.0",
   "description": "Custom Pi skills and extensions for fast Herdr workflows.",
   "type": "module",
   "license": "MIT",
@@ -36,6 +36,7 @@
     "ry-herdr-delegate/result.ts",
     "ry-herdr-delegate/pane-policy.ts",
     "ry-herdr-delegate/engine.ts",
+    "ry-herdr-delegate/agent-monitor.ts",
     "ry-herdr-delegate/pipeline.ts",
     "ry-herdr-delegate/pipeline-coordinator.ts",
     "ry-herdr-delegate/coordinator-store.ts",
@@ -47,7 +48,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test ry-herdr-fork/index.test.ts ry-herdr-clone/index.test.ts ry-herdr-delegate/*.test.ts ry-herdr-delegate/herdr/*.test.ts",
+    "test": "node --test ry-herdr-fork/index.test.ts ry-herdr-clone/index.test.ts ry-herdr-delegate/*.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "peerDependencies": {

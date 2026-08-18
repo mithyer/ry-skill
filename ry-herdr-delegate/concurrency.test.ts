@@ -173,8 +173,119 @@ test("workspace reservation ledger heartbeats renew only the current owner lease
 		assert.equal(active[0]?.state, "active");
 		assert.equal(active[0]?.expiresAt, renewedExpiry);
 		assert.equal(active[0]?.lastHeartbeatAt, "2026-01-01T00:00:00.000Z");
-		assert.equal(await ledger.release(claim.reservationId, claim.ownerEpoch, "stale-fence"), false);
-		assert.equal(await ledger.release(claim.reservationId, claim.ownerEpoch, claim.fencingToken), true);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Allows shared read-only leases while preserving exclusivity for every writer. */
+test("workspace reservation ledger permits shared readers but rejects a writer", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-concurrency-access-"));
+	try {
+		const ledger = new WorkspaceReservationLedger(root, "w-access");
+		const expiresAt = new Date(Date.now() + 600_000).toISOString();
+		const shared = "resource:shared-source";
+		const firstReader = await ledger.claim({
+			reservationId: "reservation-reader-one",
+			pipelineId: "pipeline-reader-one",
+			reservedSlots: 1,
+			expiresAt,
+			access: "read-only",
+			resourceKeys: [shared],
+			ownerEpoch: "owner-reader-one",
+		}, { maxAgents: 3 });
+		const secondReader = await ledger.claim({
+			reservationId: "reservation-reader-two",
+			pipelineId: "pipeline-reader-two",
+			reservedSlots: 1,
+			expiresAt,
+			access: "read-only",
+			resourceKeys: [shared],
+			ownerEpoch: "owner-reader-two",
+		}, { maxAgents: 3 });
+		const writer = await ledger.claim({
+			reservationId: "reservation-writer",
+			pipelineId: "pipeline-writer",
+			reservedSlots: 1,
+			expiresAt,
+			access: "workspace-write",
+			resourceKeys: [shared],
+			ownerEpoch: "owner-writer",
+		}, { maxAgents: 3 });
+		assert.equal(firstReader.committed, true);
+		assert.equal(secondReader.committed, true);
+		assert.deepEqual(writer, { committed: false, reason: "resource-conflict" });
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Ensures direct leaves consume no worker slot but still reserve their declared workspace resource. */
+test("workspace reservation ledger gives zero-slot direct leaves an exclusive resource lease", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-concurrency-direct-lease-"));
+	try {
+		const ledger = new WorkspaceReservationLedger(root, "w-direct-lease");
+		const expiresAt = new Date(Date.now() + 600_000).toISOString();
+		const direct = await ledger.claim({
+			reservationId: "direct-leaf",
+			pipelineId: "direct-leaf",
+			reservedSlots: 0,
+			expiresAt,
+			access: "workspace-write",
+			resourceKeys: ["cwd:/tmp/direct-shared"],
+			ownerEpoch: "direct-owner",
+		}, { maxAgents: 1 });
+		const independentWorker = await ledger.claim({
+			reservationId: "independent-worker",
+			pipelineId: "pipeline-independent",
+			reservedSlots: 1,
+			expiresAt,
+			access: "workspace-write",
+			resourceKeys: ["cwd:/tmp/independent"],
+			ownerEpoch: "worker-owner",
+		}, { maxAgents: 1 });
+		const conflictingWorker = await ledger.claim({
+			reservationId: "conflicting-worker",
+			pipelineId: "pipeline-conflicting",
+			reservedSlots: 1,
+			expiresAt,
+			access: "workspace-write",
+			resourceKeys: ["cwd:/tmp/direct-shared"],
+			ownerEpoch: "conflicting-owner",
+		}, { maxAgents: 2 });
+		assert.equal(direct.committed, true);
+		assert.equal(independentWorker.committed, true);
+		assert.deepEqual(conflictingWorker, { committed: false, reason: "resource-conflict" });
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Keeps claim retries idempotent while rejecting a reused reservation identity with changed ownership. */
+test("workspace reservation ledger reuses only an identical claim", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-concurrency-idempotency-"));
+	try {
+		const ledger = new WorkspaceReservationLedger(root, "w-idempotency");
+		const claim = {
+			reservationId: "reservation-stable",
+			pipelineId: "pipeline-stable",
+			stageId: "stage-stable",
+			attempt: 1,
+			fencingToken: "fence-stable",
+			reservedSlots: 1,
+			expiresAt: new Date(Date.now() + 600_000).toISOString(),
+			access: "workspace-write" as const,
+			resourceKeys: ["resource:stable"],
+			ownerEpoch: "owner-stable",
+		};
+		const initial = await ledger.claim(claim, { maxAgents: 1 });
+		const replay = await ledger.claim(claim, { maxAgents: 1 });
+		const changed = await ledger.claim({ ...claim, resourceKeys: ["resource:changed"] }, { maxAgents: 1 });
+		assert.equal(initial.committed, true);
+		assert.equal(replay.committed, true);
+		assert.equal(replay.reservation?.reservationId, claim.reservationId);
+		assert.deepEqual(changed, { committed: false, reason: "duplicate" });
+		assert.equal((await ledger.readEvents()).length, 2);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

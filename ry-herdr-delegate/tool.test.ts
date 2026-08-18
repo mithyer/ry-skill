@@ -24,14 +24,19 @@ import {
 } from "./tool.ts";
 
 /** Builds the smallest UI surface needed by direct command and input-handler tests. */
-function makeContext(idle = true, statusCalls: Array<string | undefined> = [], widgetCalls: Array<string[] | undefined> = []): ExtensionContext {
+function makeContext(
+	idle = true,
+	statusCalls: Array<string | undefined> = [],
+	widgetCalls: Array<string[] | undefined> = [],
+	notifications: Array<{ text: string; type: string }> = [],
+): ExtensionContext {
 	return {
 		mode: "tui",
 		cwd: "/tmp/project",
 		signal: undefined,
 		isIdle: () => idle,
 		ui: {
-			notify: () => undefined,
+			notify: (text: string, type: string) => { notifications.push({ text, type }); },
 			setWorkingMessage: () => undefined,
 			setWorkingVisible: () => undefined,
 			setStatus: (_key: string, text: string | undefined) => { statusCalls.push(text); },
@@ -114,6 +119,7 @@ test("selectAgentForTask routes explicit, review, engineering, and general tasks
 	assert.equal(selectAgentForTask("use Claude to review the requested change"), "claude");
 	assert.equal(selectAgentForTask("review the requested change"), "claude");
 	assert.equal(selectAgentForTask("修复登录失败并运行测试"), "codex");
+	assert.equal(selectAgentForTask("ExerciseDetailsSharedViewControllerV2底部需要和ExerciseHomeViewControllerV2一样，底部要有运动id"), "codex");
 	assert.equal(selectAgentForTask("整理一下当前进度"), "pi");
 });
 
@@ -202,7 +208,29 @@ test("createDelegateCommandHandler executes the supplied task and updates direct
 	]);
 });
 
-/** Verifies the slash command persists a complete conclusion with agent work and validation details. */
+/** Routes source-symbol modification wording through the slash command to the Codex worker profile. */
+test("createDelegateCommandHandler routes a ViewController change request to Codex", async () => {
+	const calls: DelegateToolParams[] = [];
+	const handler = createDelegateCommandHandler(makeExecutor(calls));
+	const task = "ExerciseDetailsSharedViewControllerV2底部需要和ExerciseHomeViewControllerV2一样，底部要有运动id";
+	await handler(task, makeContext() as ExtensionCommandContext);
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].role, "worker");
+	assert.equal(calls[0].agent, "codex");
+	assert.equal(calls[0].timeoutMs, 600000);
+	assert.equal(calls[0].task, task);
+});
+
+test("createDelegateCommandHandler gives a Pi fallback task the slash timeout", async () => {
+	const calls: DelegateToolParams[] = [];
+	const handler = createDelegateCommandHandler(makeExecutor(calls));
+	await handler("整理一下当前进度", makeContext() as ExtensionCommandContext);
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].role, "delegate");
+	assert.equal(calls[0].agent, "pi");
+	assert.equal(calls[0].timeoutMs, 600000);
+});
+
 test("createDelegateCommandHandler persists the agent conclusion", async () => {
 	const transcript: Array<Record<string, unknown>> = [];
 	const executor = async (): Promise<AgentToolResult<DelegateToolDetails>> => ({
@@ -265,7 +293,59 @@ test("direct delegate UI shows a listening spinner while monitoring", async () =
 	assert.equal(widgets.at(-1), undefined);
 });
 
-/** Verifies a closed child target clears the persistent parent status and widget surfaces. */
+/** Reconciles a late exact completion into a final parent conclusion and clears the lifecycle surface. */
+test("direct delegate UI appends a reconciled late completion", async () => {
+	const statuses: Array<string | undefined> = [];
+	const widgets: Array<string[] | undefined> = [];
+	const notifications: Array<{ text: string; type: string }> = [];
+	const transcript: Array<Record<string, unknown>> = [];
+	const ctx = makeContext(true, statuses, widgets, notifications) as ExtensionCommandContext;
+	const gateway = {
+		getAgent: async () => ({ agent: "worker-late", paneId: "w-test:p5", workspaceId: "w-test", status: "idle" }),
+	} as unknown as HerdrGateway;
+	const executor = async (_params: DelegateToolParams, context: ExtensionContext): Promise<AgentToolResult<DelegateToolDetails>> => {
+		startDirectDelegateUiMonitor(context, gateway, "worker-late", "w-test:p5", 1, {
+			status: "PARTIAL",
+			agent: "worker-late",
+			paneId: "w-test:p5",
+			error: "delegate stage operation was aborted",
+		}, async () => ({
+			status: "DONE",
+			communicationId: "communication-late",
+			communicationFile: "/private/communication-late.jsonl",
+			agent: "worker-late",
+			paneId: "w-test:p5",
+			completion: { status: "DONE", summary: "late completion was reconciled", validation: "build passed" },
+		}));
+		return {
+			content: [{ type: "text", text: "PARTIAL" }],
+			details: {
+				status: "PARTIAL",
+				result: {
+					status: "PARTIAL",
+					communicationId: "communication-late",
+					communicationFile: "/private/communication-late.jsonl",
+					agent: "worker-late",
+					paneId: "w-test:p5",
+					error: "delegate stage operation was aborted",
+				},
+				error: "delegate stage operation was aborted",
+			},
+		};
+	};
+	const handler = createDelegateCommandHandler(executor, (entry) => transcript.push(entry as unknown as Record<string, unknown>));
+	await handler("implement the requested change", ctx);
+	await new Promise<void>((resolve) => setTimeout(resolve, 20));
+	assert.deepEqual(transcript, [
+		{ kind: "prompt", prompt: "/ry-herdr-agent implement the requested change" },
+		{ kind: "result", status: "PARTIAL", agent: "worker-late", error: "delegate stage operation was aborted" },
+		{ kind: "result", status: "DONE", agent: "worker-late", summary: "late completion was reconciled", validation: "build passed" },
+	]);
+	assert.equal(notifications.some(({ text, type }) => type === "info" && text.includes("late completion was reconciled")), true);
+	assert.equal(statuses.at(-1), undefined);
+	assert.equal(widgets.at(-1), undefined);
+});
+
 test("direct delegate UI clears after child closure", async () => {
 	const statuses: Array<string | undefined> = ["Herdr delegate · ERROR · codex"];
 	const widgets: Array<string[] | undefined> = [["Herdr delegate · ERROR", "Pane: w20:p3"]];

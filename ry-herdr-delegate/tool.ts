@@ -148,6 +148,9 @@ const CLAUDE_TASK_INTENT = /(?:审查|评审|review|audit|分析|analy[sz]e|研�
 /** Implementation and validation work benefits most from Codex's engineering profile. */
 const CODEX_TASK_INTENT = /(?:处理|解决|修复|实现|修改|编写|重构|排查|调试|执行|运行|测试|部署|查看|检查|fix|implement|change|write|refactor|debug|execute|run|test|build|deploy|check|inspect)/iu;
 
+/** Code-symbol references in a slash task identify source-level work even when the request omits an action verb. */
+const CODE_SYMBOL_TASK_INTENT = /\b[A-Za-z][A-Za-z0-9_]*(?:ViewController|View|Controller|Cell|Manager|Service|Model|V\d+)\b/u;
+
 /**
  * Detects an explicit Codex/Claude work directive without treating incidental mentions as execution requests.
  * @param text Raw user prompt received before the agent loop.
@@ -177,7 +180,7 @@ export function selectAgentForTask(task: string): TaskDelegateAgent {
 	const explicitAgent = task.match(AUTOMATIC_AGENT_DIRECTIVE)?.[1]?.toLowerCase();
 	if (explicitAgent === "codex" || explicitAgent === "claude") return explicitAgent;
 	if (CLAUDE_TASK_INTENT.test(task)) return "claude";
-	if (CODEX_TASK_INTENT.test(task)) return "codex";
+	if (CODEX_TASK_INTENT.test(task) || CODE_SYMBOL_TASK_INTENT.test(task)) return "codex";
 	return "pi";
 }
 
@@ -345,6 +348,12 @@ const DIRECT_UI_POLL_MS = 1000;
 /** ASCII frames used to show that an unresolved child pane is still being monitored. */
 const DIRECT_UI_SPINNER = ["|", "/", "-", "\\"] as const;
 
+/** Callback that performs a no-resend exact-session completion reconciliation. */
+type DirectCompletionReconciler = () => Promise<DelegateResult | undefined>;
+
+/** Callback used to append a final parent-visible conclusion after a late exact completion. */
+type DirectReconciledHandler = (result: DelegateResult) => void;
+
 /** Active direct-leaf UI monitors keyed by the parent session surface. */
 type DirectUiMonitor = {
 	/** Parent context whose status and widget are being monitored. */
@@ -357,6 +366,12 @@ type DirectUiMonitor = {
 	paneId: string;
 	/** Final direct result details retained while the pane remains unresolved. */
 	details: DirectUiDetails;
+	/** Exact-session operation that can observe a late completion without sending new work. */
+	reconcile?: DirectCompletionReconciler;
+	/** Parent-facing callback invoked once reconciliation yields a terminal semantic result. */
+	onReconciled?: DirectReconciledHandler;
+	/** Retained reconciled result for a callback attached after the first monitor poll. */
+	reconciledResult?: DelegateResult;
 	/** Current ASCII spinner frame used while polling the child. */
 	spinnerIndex: number;
 	/** Poll timer for child lifecycle checks. */
@@ -367,6 +382,9 @@ type DirectUiMonitor = {
 
 /** Active direct-leaf UI monitors keyed by the parent session surface. */
 const directUiMonitors = new Map<string, DirectUiMonitor>();
+
+/** Pending transcript handlers registered before a direct executor has created its monitor. */
+const directUiReconciledHandlers = new Map<string, DirectReconciledHandler>();
 
 /** Returns the parent-session key shared by the direct status surface and its lifecycle monitor. */
 function directUiMonitorKey(ctx: ExtensionContext): string {
@@ -403,19 +421,32 @@ function stopDirectUiMonitor(ctx: ExtensionContext, clearSurface: boolean): void
 		clearInterval(monitor.timer);
 		directUiMonitors.delete(key);
 	}
+	directUiReconciledHandlers.delete(key);
 	if (clearSurface) clearDirectDelegateUi(ctx);
 }
 
+/** Installs the parent transcript callback after a direct executor has created its monitor. */
+function setDirectUiMonitorReconciledHandler(ctx: ExtensionContext, handler: DirectReconciledHandler): void {
+	const key = directUiMonitorKey(ctx);
+	directUiReconciledHandlers.set(key, handler);
+	const monitor = directUiMonitors.get(key);
+	if (!monitor) return;
+	monitor.onReconciled = handler;
+	if (monitor.reconciledResult) handler(monitor.reconciledResult);
+}
+
 /**
- * Monitors one terminal direct child until Herdr proves its target pane is closed.
+ * Monitors one unresolved direct child until closure or a same-session late completion can be reconciled.
  * @param ctx Parent Pi extension context that owns the status surface.
  * @param gateway Herdr gateway used for exact child lookups.
  * @param agent Exact Herdr child target to monitor.
  * @param paneId Pane shown in the parent status surface.
  * @param pollMs Lifecycle polling interval in milliseconds.
  * @param details Final result details retained while the child remains unresolved.
- * @returns Nothing; cleanup is performed asynchronously when the child closes.
+ * @param reconcile Optional exact-session no-resend completion reconciler for PARTIAL leaves.
+ * @returns Nothing; cleanup is performed asynchronously after closure or a reconciled terminal result.
  * TEST:ry-herdr-delegate/tool.test.ts[direct delegate UI clears after child closure]
+ * TEST:ry-herdr-delegate/tool.test.ts[direct delegate UI appends a reconciled late completion]
  */
 export function startDirectDelegateUiMonitor(
 	ctx: ExtensionContext,
@@ -424,16 +455,21 @@ export function startDirectDelegateUiMonitor(
 	paneId: string,
 	pollMs = DIRECT_UI_POLL_MS,
 	details?: DirectUiDetails,
+	reconcile?: DirectCompletionReconciler,
 ): void {
 	if (ctx.mode !== "tui") return;
-	stopDirectUiMonitor(ctx, false);
 	const key = directUiMonitorKey(ctx);
-	const monitor = {
+	const pendingHandler = directUiReconciledHandlers.get(key);
+	stopDirectUiMonitor(ctx, false);
+	if (pendingHandler) directUiReconciledHandlers.set(key, pendingHandler);
+	const monitor: DirectUiMonitor = {
 		ctx,
 		gateway,
 		agent,
 		paneId,
 		details: details ?? { status: "LISTENING", agent, paneId },
+		reconcile,
+		onReconciled: directUiReconciledHandlers.get(key),
 		spinnerIndex: 0,
 		timer: undefined as unknown as ReturnType<typeof setInterval>,
 		polling: false,
@@ -443,13 +479,27 @@ export function startDirectDelegateUiMonitor(
 		monitor.spinnerIndex += 1;
 		renderDirectDelegateUi(monitor.ctx, { ...monitor.details, monitorFrame: frame });
 	};
+	const settleReconciliation = (result: DelegateResult): void => {
+		monitor.reconciledResult = result;
+		renderDirectDelegateUi(ctx, directUiDetailsForResult(result));
+		if (monitor.onReconciled) monitor.onReconciled(result);
+		else ctx.ui.notify(formatReconciledDelegateNotification(result), result.status === "DONE" ? "info" : result.status === "ERROR" ? "error" : "warning");
+		stopDirectUiMonitor(ctx, true);
+	};
 	const poll = async (): Promise<void> => {
 		renderListeningUi();
 		if (monitor.polling) return;
 		monitor.polling = true;
 		try {
 			const snapshot = await gateway.getAgent(agent);
-			if (snapshot.paneId !== paneId) stopDirectUiMonitor(ctx, true);
+			if (snapshot.paneId !== paneId) {
+				stopDirectUiMonitor(ctx, true);
+				return;
+			}
+			if (monitor.reconcile && ["idle", "done", "blocked"].includes(snapshot.status)) {
+				const reconciled = await monitor.reconcile();
+				if (reconciled) settleReconciliation(reconciled);
+			}
 		} catch (error) {
 			if (isDirectAgentClosedError(error)) stopDirectUiMonitor(ctx, true);
 		} finally {
@@ -469,6 +519,7 @@ function stopAllDirectUiMonitors(): void {
 		directUiMonitors.delete(directUiMonitorKey(monitor.ctx));
 		clearDirectDelegateUi(monitor.ctx);
 	}
+	directUiReconciledHandlers.clear();
 }
 
 /** Direct-leaf state used by the parent Pi status and widget surfaces. */
@@ -493,6 +544,32 @@ export interface DirectUiDetails {
 	monitorFrame?: string;
 	/** Redacted error text shown for a failed request. */
 	error?: string;
+}
+
+/** Projects a structured direct result into the non-sensitive status fields shown in the parent pane. */
+function directUiDetailsForResult(result: DelegateResult): DirectUiDetails {
+	return {
+		status: result.status,
+		agent: result.agent,
+		paneId: result.paneId,
+		summary: result.completion?.summary,
+		validation: result.completion?.validation,
+		changedFiles: result.completion?.changedFiles,
+		risks: result.completion?.risks,
+		error: result.error,
+	};
+}
+
+/** Formats a late reconciled result without exposing its record path or exact session identity. */
+function formatReconciledDelegateNotification(result: DelegateResult): string {
+	return [
+		`ry_herdr_delegate_tool: ${result.status}`,
+		result.agent ? `AGENT: ${result.agent}` : undefined,
+		result.completion?.summary ? `SUMMARY: ${result.completion.summary}` : result.error ? `ERROR: ${result.error}` : undefined,
+		result.completion?.validation ? `VALIDATION: ${result.completion.validation}` : undefined,
+		result.completion?.changedFiles ? `CHANGED FILES: ${result.completion.changedFiles}` : undefined,
+		result.completion?.risks ? `RISKS: ${result.completion.risks}` : undefined,
+	].filter((line): line is string => line !== undefined).join("\n");
 }
 
 /** Returns a parent-session-isolated key for one direct-leaf UI surface. */
@@ -575,6 +652,28 @@ function stopAllPipelineUiMonitors(): void {
 	for (const key of pipelineUiMonitors.keys()) stopPipelineUiMonitor(key);
 }
 
+/** Builds a direct-monitor callback that may only reconcile the original PARTIAL exact Pi session. */
+function createDirectPartialReconciler(
+	ctx: ExtensionContext,
+	config: ReturnType<typeof parseDelegateConfig>,
+	gateway: HerdrGateway,
+	workspaceId: string | undefined,
+	result: DelegateResult,
+): DirectCompletionReconciler | undefined {
+	if (result.status !== "PARTIAL" || !workspaceId || !result.agent || !result.paneId || !result.agentSession) return undefined;
+	const store = new PipelineStore(ctx.cwd, workspaceId);
+	const engine = new DelegateEngine({
+		gateway,
+		config,
+		communicationDirectory: join(store.coordinatorStore.stateDirectory, "communications"),
+		capabilities: { childEnvVerified: false },
+	});
+	return () => engine.reconcilePartial(result, {
+		workspaceId,
+		layoutLock: (callback) => store.coordinatorStore.withLayoutLock(callback),
+	}, ctx.signal);
+}
+
 /** Executes the currently implemented leaf or pipeline actions. */
 export async function executeDelegateTool(
 	params: DelegateToolParams,
@@ -613,20 +712,14 @@ export async function executeDelegateTool(
 		try {
 			const result = await executeDelegateToolWithConfig(params, ctx, signal, config, directGateway);
 			if (params.action === "delegate" && result.details) {
-				const directDetails: DirectUiDetails = {
-					status: result.details.status,
-					agent: result.details.result?.agent,
-					paneId: result.details.result?.paneId,
-					summary: result.details.result?.completion?.summary,
-					validation: result.details.result?.completion?.validation,
-					changedFiles: result.details.result?.completion?.changedFiles,
-					risks: result.details.result?.completion?.risks,
-					error: result.details.error,
-				};
-				renderDirectDelegateUi(ctx, directDetails);
 				const directResult = result.details.result;
-				if (directGateway && directResult?.status !== "DONE" && directResult?.agent && directResult.paneId) {
-					startDirectDelegateUiMonitor(ctx, directGateway, directResult.agent, directResult.paneId, DIRECT_UI_POLL_MS, directDetails);
+				const directDetails = directResult
+					? directUiDetailsForResult(directResult)
+					: { status: result.details.status, error: result.details.error };
+				renderDirectDelegateUi(ctx, directDetails);
+				if (directGateway && directResult && directResult.status !== "DONE" && directResult.agent && directResult.paneId) {
+					const reconcile = createDirectPartialReconciler(ctx, config, directGateway, workspaceId, directResult);
+					startDirectDelegateUiMonitor(ctx, directGateway, directResult.agent, directResult.paneId, DIRECT_UI_POLL_MS, directDetails, reconcile);
 				} else {
 					clearDirectDelegateUi(ctx);
 				}
@@ -659,7 +752,8 @@ interface DirectDelegateOverrides {
 /** Resolves slash-command task routing and its long-running manual-task budget. */
 function selectSlashDelegateOverrides(task: string): DirectDelegateOverrides {
 	const agent = selectAgentForTask(task);
-	if (agent === "pi") return { role: "delegate", agent };
+	// A slash command is an explicit long-running delegation request even when its fallback profile is Pi.
+	if (agent === "pi") return { role: "delegate", agent, timeoutMs: SLASH_COMMAND_TIMEOUT_MS };
 	return { role: "worker", agent, timeoutMs: SLASH_COMMAND_TIMEOUT_MS };
 }
 
@@ -698,7 +792,18 @@ function formatDirectTranscriptEntry(entry: DirectTranscriptEntry): string {
 	].filter((line): line is string => line !== undefined).join("\n");
 }
 
-/** Shows the direct delegate result while keeping the command and input paths consistent. */
+/** Converts a structured delegate result into one concise persistent parent transcript conclusion. */
+function directTranscriptResultFromDelegate(result: DelegateResult): DirectTranscriptEntry {
+	const entry: DirectTranscriptEntry = { kind: "result", status: result.status };
+	if (result.agent) entry.agent = result.agent;
+	if (result.completion?.summary) entry.summary = result.completion.summary;
+	if (result.completion?.validation) entry.validation = result.completion.validation;
+	if (result.completion?.changedFiles) entry.changedFiles = result.completion.changedFiles;
+	if (result.completion?.risks) entry.risks = result.completion.risks;
+	if (result.error) entry.error = result.error;
+	return entry;
+}
+
 function delegateNotificationType(result: AgentToolResult<DelegateToolDetails>): "info" | "warning" | "error" {
 	if (result.details?.status === "ERROR") return "error";
 	return result.details?.status === "DONE" ? "info" : "warning";
@@ -715,6 +820,13 @@ async function runDirectDelegate(
 	ctx.ui.setWorkingMessage("Running Herdr delegate...");
 	ctx.ui.setWorkingVisible(true);
 	renderDirectDelegateUi(ctx, { status: "RUNNING", role: overrides.role, agent: overrides.agent });
+	setDirectUiMonitorReconciledHandler(ctx, (reconciled) => {
+		transcriptWriter?.(directTranscriptResultFromDelegate(reconciled));
+		ctx.ui.notify(
+			formatReconciledDelegateNotification(reconciled),
+			reconciled.status === "DONE" ? "info" : reconciled.status === "ERROR" ? "error" : "warning",
+		);
+	});
 	try {
 		const result = await executor({ action: "delegate", task, role: overrides.role, agent: overrides.agent, timeoutMs: overrides.timeoutMs }, ctx, ctx.signal);
 		const details = result.details;
@@ -734,6 +846,9 @@ async function runDirectDelegate(
 				risks: completion?.risks,
 				error: details?.error,
 			});
+		} else if (!directUiMonitors.has(directUiMonitorKey(ctx))) {
+			// Test executors and non-Herdr hosts can return an unresolved result without creating a monitor.
+			directUiReconciledHandlers.delete(directUiMonitorKey(ctx));
 		}
 		// Keep optional fields absent from the persisted entry so session JSON stays concise and deterministic.
 		const transcriptEntry: DirectTranscriptEntry = { kind: "result", status };
@@ -784,15 +899,19 @@ export function createDelegateCommandHandler(
 /**
  * Creates the pre-agent input handler for explicit Codex/Claude work directives.
  * @param executor Runtime executor, injectable for automatic-routing regression tests.
+ * @param transcriptWriter Optional parent transcript writer for a late reconciled conclusion.
  * @returns A Pi input handler that handles only actionable direct-agent prompts.
  * TEST:ry-herdr-delegate/tool.test.ts[createAutomaticDelegateInputHandler]
  */
-export function createAutomaticDelegateInputHandler(executor: DelegateExecutor = executeDelegateTool): (event: InputEvent, ctx: ExtensionContext) => Promise<InputEventResult> {
+export function createAutomaticDelegateInputHandler(
+	executor: DelegateExecutor = executeDelegateTool,
+	transcriptWriter?: DirectTranscriptWriter,
+): (event: InputEvent, ctx: ExtensionContext) => Promise<InputEventResult> {
 	return async (event, ctx) => {
 		if (event.source === "extension" || event.streamingBehavior || ctx.mode !== "tui" || !ctx.isIdle()) return { action: "continue" };
 		const request = detectAutomaticDelegateRequest(event.text);
 		if (!request) return { action: "continue" };
-		await runDirectDelegate(request.task, ctx, { role: "worker", agent: request.agent }, executor);
+		await runDirectDelegate(request.task, ctx, { role: "worker", agent: request.agent }, executor, transcriptWriter);
 		return { action: "handled" };
 	};
 }
@@ -1032,7 +1151,7 @@ export function registerDelegateTool(pi: ExtensionAPI): void {
 		description: "Execute one Herdr delegate leaf task: /ry-herdr-agent <task>",
 		handler: createDelegateCommandHandler(executeDelegateTool, writeDirectTranscript),
 	});
-	pi.on("input", createAutomaticDelegateInputHandler());
+	pi.on("input", createAutomaticDelegateInputHandler(executeDelegateTool, writeDirectTranscript));
 	pi.on("session_shutdown", () => {
 		stopAllPipelineUiMonitors();
 		stopAllDirectUiMonitors();

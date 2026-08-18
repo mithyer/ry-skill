@@ -48,6 +48,11 @@ const EVENT_TYPES = new Set<EventType>([
 	"pipeline.control",
 	"stale-attempt-diagnostic",
 	"stale-control-diagnostic",
+	"pre-relay-checkpoint",
+	"relay-retry",
+	"observation",
+	"reconciliation-result",
+	"monitor-recovered",
 ]);
 
 /** Event actors accepted by the runtime event-log schema. */
@@ -253,6 +258,13 @@ function sameEventBody(left: JsonlEvent, right: JsonlEvent): boolean {
 	return stableJson(leftBody) === stableJson(rightBody);
 }
 
+/** Compares semantic result content while ignoring generated event identity and timestamp. */
+function sameResultBody(left: JsonlEvent, right: JsonlEvent): boolean {
+	const { seq: _leftSeq, eventId: _leftEventId, timestamp: _leftTimestamp, ...leftBody } = left;
+	const { seq: _rightSeq, eventId: _rightEventId, timestamp: _rightTimestamp, ...rightBody } = right;
+	return stableJson(leftBody) === stableJson(rightBody);
+}
+
 /** Appends one event with lock, sequence, idempotency, and read-after-write validation. */
 export async function appendEvent(
 	file: string,
@@ -277,6 +289,20 @@ export async function appendEvent(
 		const existingByMessageId = input.messageId
 			? before.events.find(({ event }) => event.messageId === input.messageId)
 			: undefined;
+		const existingByResultKey = (input.type === "result" || input.type === "reconciliation-result") && typeof input.payload.resultKey === "string"
+			? before.events.find(({ event }) => event.type === input.type && event.payload.resultKey === input.payload.resultKey)
+			: undefined;
+		if (existingByResultKey) {
+			const expected = materializeEvent(input, existingByResultKey.event.seq);
+			if (!sameResultBody(expected, existingByResultKey.event)) throw new Error(`JSONL result idempotency conflict for ${input.payload.resultKey}`);
+			return {
+				event: existingByResultKey.event,
+				lineStart: existingByResultKey.line,
+				lineEnd: existingByResultKey.line,
+				lineCount: 1,
+				idempotent: true,
+			};
+		}
 		if (existingByEventId || existingByMessageId) {
 			if (!existingByEventId || (existingByMessageId && existingByEventId.event.eventId !== existingByMessageId.event.eventId)) {
 				throw new Error("JSONL event idempotency conflict: eventId and messageId identify different events");

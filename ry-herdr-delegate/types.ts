@@ -2,7 +2,7 @@
 export type AgentKind = "codex" | "claude" | "pi";
 
 /** Transport lifecycle reported by Herdr for an agent pane. */
-export type AgentTransportStatus = "working" | "blocked" | "idle" | "done" | "unknown";
+export type AgentTransportStatus = "working" | "blocked" | "idle" | "done" | "unknown" | "closed";
 
 /** Semantic status returned by the delegation completion contract. */
 export type SemanticStatus = "DONE" | "BLOCKED" | "PARTIAL" | "ERROR";
@@ -188,6 +188,8 @@ export interface DelegateRequest {
 	overrides?: DelegateOverrides;
 	/** Pipeline transaction identity when a coordinator owns this stage. */
 	transaction?: string;
+	/** Pipeline stage identity when a coordinator owns this stage. */
+	stageId?: string;
 	/** Pipeline stage occurrence. */
 	stageOccurrence?: number;
 	/** Prior communication log linked to this stage. */
@@ -212,6 +214,8 @@ export interface DelegateRequest {
 	resourceKeys?: readonly string[];
 	/** Access mode recorded for the stage attempt. */
 	access?: StageAccess;
+	/** Parent/coordinator execution fence used for result idempotency. */
+	executionFence?: string;
 }
 
 /** Parent runtime context required to create a sibling Herdr pane. */
@@ -316,6 +320,8 @@ export interface TransportMetadata {
 	exactSession?: SessionIdentity;
 	/** Terminal capture attempt number. */
 	captureAttempt?: number;
+	/** Delivery classification for a relay or external operation. */
+	deliveryState?: "NOT_SENT" | "SENT" | "UNKNOWN";
 }
 
 /** Agent metadata returned by Herdr get/snapshot operations. */
@@ -670,7 +676,12 @@ export type EventType =
 	| "stage-released"
 	| "pipeline.control"
 	| "stale-attempt-diagnostic"
-	| "stale-control-diagnostic";
+	| "stale-control-diagnostic"
+	| "pre-relay-checkpoint"
+	| "relay-retry"
+	| "observation"
+	| "reconciliation-result"
+	| "monitor-recovered";
 
 /** One validated, physically line-oriented JSONL event. */
 export interface JsonlEvent {

@@ -30,6 +30,8 @@ interface FakeGatewayOptions {
 	session?: SessionIdentity;
 	/** Session identity returned by resumed agent startup. */
 	startedSession?: SessionIdentity;
+	/** Session identity returned only by post-start getAgent calls. */
+	lookupSession?: SessionIdentity;
 	/** Terminal snapshots returned sequentially to simulate Herdr's delayed TUI refresh. */
 	outputs?: readonly string[];
 	/** Error thrown by the simulated relay command. */
@@ -47,7 +49,9 @@ class FakeGateway implements HerdrGateway {
 	private outputIndex = 0;
 	private readonly closedTarget?: string;
 	private readonly startedSession?: SessionIdentity;
+	private readonly lookupSession?: SessionIdentity;
 	private readonly promptError?: Error;
+	private relaySubmitted = false;
 
 	/**
 	 * Creates a fake child lifecycle.
@@ -62,6 +66,7 @@ class FakeGateway implements HerdrGateway {
 		this.outputs = options.outputs;
 		this.closedTarget = options.closedTarget;
 		this.startedSession = options.startedSession;
+		this.lookupSession = options.lookupSession;
 		this.promptError = options.promptError;
 		this.childSnapshot = {
 			agent: "worker-test",
@@ -83,6 +88,7 @@ class FakeGateway implements HerdrGateway {
 	async prompt(input: PromptInput): Promise<HerdrAgentSnapshot | undefined> {
 		this.calls.push("prompt");
 		this.lastPrompt = input;
+		this.relaySubmitted = true;
 		if (this.promptError) throw this.promptError;
 		return this.childSnapshot;
 	}
@@ -93,10 +99,11 @@ class FakeGateway implements HerdrGateway {
 			// 404 is the gateway's definitive closed-pane signal.
 			throw Object.assign(new Error("agent not found"), { code: 404 });
 		}
-		return this.childSnapshot;
+		return this.lookupSession ? { ...this.childSnapshot, agentSession: this.lookupSession } : this.childSnapshot;
 	}
 	async readAgent(_target: string): Promise<HerdrAgentOutput> {
 		this.calls.push("read");
+		if (!this.relaySubmitted) return { text: "" };
 		const output = this.outputs?.[Math.min(this.outputIndex++, this.outputs.length - 1)] ?? this.output;
 		return { text: output };
 	}
@@ -136,8 +143,9 @@ test("DelegateEngine completes a leaf only after exact checkpoint and DONE contr
 			sourcePaneId: "w-test:p1",
 		});
 		assert.equal(result.status, "DONE");
-		assert.deepEqual(gateway.lastPrompt && { wait: gateway.lastPrompt.wait, timeoutMs: gateway.lastPrompt.timeoutMs }, { wait: true, timeoutMs: 300000 });
-		assert.deepEqual(gateway.calls, ["split", "start", "prompt", "wait", "read", "move"]);
+		assert.equal(gateway.lastPrompt?.wait, false);
+		assert.ok((gateway.lastPrompt?.timeoutMs ?? 0) >= 300000);
+		assert.deepEqual(gateway.calls, ["split", "start", "get", "read", "prompt", "wait", "read", "move"]);
 		assert.equal(gateway.lastMove?.paneId, "w-test:p2");
 		assert.equal(gateway.lastMove?.newTab, true);
 		assert.equal(gateway.lastMove?.tabLabel, `closed-pane-${result.communicationId}`);
@@ -153,26 +161,115 @@ test("DelegateEngine completes a leaf only after exact checkpoint and DONE contr
 });
 
 
-/** Verifies Herdr's own command timeout is an unfinished external turn, not a semantic ERROR. */
-test("DelegateEngine classifies a Herdr command timeout as PARTIAL and preserves the child", async () => {
+/** Verifies an unknown relay submission continues through the same exact-session monitor. */
+test("DelegateEngine observes a child after an ambiguous Herdr relay failure", async () => {
 	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-command-timeout-"));
 	try {
 		const timeout = new HerdrCommandError("The operation was aborted", ["agent", "prompt"], null, null, "", "", true);
 		const gateway = new FakeGateway("STATUS: DONE\nSUMMARY: late completion\nVALIDATION: late validation", "working", true, { promptError: timeout });
 		const engine = await createEngine(gateway, root);
-		const result = await engine.run({ action: "delegate", task: "run a slow build", role: "worker" }, {
+		const result = await engine.run({ action: "delegate", task: "run a slow build", role: "worker", deadlineAt: new Date(Date.now() + 1000).toISOString() }, {
 			cwd: "/tmp/project",
 			workspaceId: "w-test",
 			sourcePaneId: "w-test:p1",
 		});
-		assert.equal(result.status, "PARTIAL");
-		assert.equal(result.error, "delegate stage operation was aborted");
-		assert.deepEqual(gateway.calls, ["split", "start", "prompt"]);
+		assert.equal(result.status, "DONE");
+		assert.equal(result.completion?.summary, "late completion");
+		assert.deepEqual(gateway.calls, ["split", "start", "get", "read", "prompt", "wait", "read", "move"]);
 		const events = (await readEventLog(result.communicationFile)).events.map(({ event }) => event);
-		const promptCheckpoint = events.find((event) => event.type === "checkpoint" && event.payload.operation === "prompt");
-		assert.equal(promptCheckpoint?.payload.operation, "prompt");
+		const promptCheckpoint = events.find((event) => event.type === "checkpoint" && event.payload.operation === "relay-submitted");
 		assert.equal(promptCheckpoint?.payload.accepted, "unknown");
-		assert.equal(events.at(-1)?.type, "error");
+		assert.equal(events.at(-1)?.type, "pane-disposition");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Verifies only explicit pre-delivery evidence permits one same-relay retry. */
+test("DelegateEngine retries an explicitly unsent relay once", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-relay-retry-"));
+	try {
+		const notSent = Object.assign(new Error("spawn failed before delivery"), { deliveryState: "NOT_SENT" as const });
+		const gateway = new FakeGateway("STATUS: DONE\nSUMMARY: retry completed\nVALIDATION: retry validation", "working", true, { promptError: notSent });
+		const engine = await createEngine(gateway, root);
+		const result = await engine.run({ action: "delegate", task: "retry a relay", role: "worker", deadlineAt: new Date(Date.now() + 1_000).toISOString() }, {
+			cwd: "/tmp/project",
+			workspaceId: "w-test",
+			sourcePaneId: "w-test:p1",
+		});
+		assert.equal(result.status, "DONE");
+		assert.equal(gateway.calls.filter((call) => call === "prompt").length, 2);
+		const events = (await readEventLog(result.communicationFile)).events.map(({ event }) => event);
+		assert.equal(events.some((event) => event.type === "relay-retry"), true);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Reconciles only a late completion tied to the original exact Pi relay without sending another prompt. */
+test("DelegateEngine reconciles a late exact Pi completion without resending", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-reconcile-"));
+	try {
+		const sessionFile = join(root, "child-session.jsonl");
+		const session = { kind: "path" as const, source: "herdr:pi", value: sessionFile };
+		const timeout = new HerdrCommandError("The operation was aborted", ["agent", "prompt"], null, null, "", "", true);
+		const gateway = new FakeGateway("", "idle", true, { session, promptError: timeout });
+		const engine = await createEngine(gateway, root);
+		const partial = await engine.run({ action: "delegate", task: "run a slow build", role: "worker", deadlineAt: new Date(Date.now() + 3_000).toISOString() }, {
+			cwd: "/tmp/project",
+			workspaceId: "w-test",
+			sourcePaneId: "w-test:p1",
+		});
+		assert.equal(partial.status, "PARTIAL");
+		const handoff = (await readEventLog(partial.communicationFile)).events.find(({ event }) => event.type === "task");
+		assert.ok(handoff?.event.messageId);
+		const relay = buildRelayEnvelope(partial.communicationFile, handoff.line, handoff.line, 1, handoff.event.messageId);
+		await writeFile(sessionFile, [
+			piSessionMessage("user", relay),
+			piSessionMessage("assistant", "STATUS: DONE\nSUMMARY: completed after the parent wait ended\nVALIDATION: build passed"),
+		].join("\n"));
+		const reconciled = await engine.reconcilePartial(partial, {
+			workspaceId: "w-test",
+		});
+		assert.equal(reconciled?.status, "DONE");
+		assert.equal(reconciled?.completion?.summary, "completed after the parent wait ended");
+		assert.equal(gateway.calls.filter((call) => call === "prompt").length, 1);
+		assert.equal(gateway.calls.includes("move"), true);
+		const events = (await readEventLog(partial.communicationFile)).events.map(({ event }) => event);
+		const reconciledResult = events.find((event) => event.type === "reconciliation-result" && event.payload.operation === "reconcile");
+		assert.equal(reconciledResult?.payload.status, "DONE");
+		assert.equal(reconciledResult?.payload.reconciliation, true);
+		assert.equal(events.at(-1)?.type, "pane-disposition");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Refuses a late completion when Herdr now reports a different exact child session. */
+test("DelegateEngine leaves a partial result unchanged when reconciliation session continuity fails", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-reconcile-mismatch-"));
+	try {
+		const sessionFile = join(root, "expected-child-session.jsonl");
+		const session = { kind: "path" as const, source: "herdr:pi", value: sessionFile };
+		const timeout = new HerdrCommandError("The operation was aborted", ["agent", "prompt"], null, null, "", "", true);
+		const gateway = new FakeGateway("", "idle", true, {
+			session,
+			lookupSession: { kind: "path", source: "herdr:pi", value: join(root, "replacement-session.jsonl") },
+			promptError: timeout,
+		});
+		const engine = await createEngine(gateway, root);
+		const partial = await engine.run({ action: "delegate", task: "run a slow build", role: "worker", deadlineAt: new Date(Date.now() + 3_000).toISOString() }, {
+			cwd: "/tmp/project",
+			workspaceId: "w-test",
+			sourcePaneId: "w-test:p1",
+		});
+		const reconciled = await engine.reconcilePartial(partial, { workspaceId: "w-test" });
+		assert.equal(reconciled, undefined);
+		assert.equal(gateway.calls.filter((call) => call === "prompt").length, 0);
+		assert.equal(gateway.calls.includes("get"), true);
+		const events = (await readEventLog(partial.communicationFile)).events.map(({ event }) => event);
+		assert.equal(events.some((event) => event.type === "result" && event.payload.operation === "reconcile"), false);
+		assert.equal(gateway.calls.includes("move"), false);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
@@ -237,7 +334,7 @@ test("DelegateEngine rereads a stale terminal snapshot before parsing the comple
 			sourcePaneId: "w-test:p1",
 		});
 		assert.equal(result.status, "DONE");
-		assert.equal(gateway.calls.filter((call) => call === "read").length, 2);
+		assert.equal(gateway.calls.filter((call) => call === "read").length, 3);
 		assert.deepEqual(delays, [250]);
 	} finally {
 		await rm(root, { recursive: true, force: true });
@@ -273,7 +370,7 @@ test("DelegateEngine keeps rereading a slow terminal refresh within the bounded 
 		});
 		assert.equal(result.status, "DONE");
 		assert.equal(result.completion?.summary, "delayed refresh");
-		assert.equal(gateway.calls.filter((call) => call === "read").length, 6);
+		assert.equal(gateway.calls.filter((call) => call === "read").length, 7);
 		assert.deepEqual(delays, [250, 250, 250, 250, 250]);
 	} finally {
 		await rm(root, { recursive: true, force: true });
@@ -305,7 +402,7 @@ test("DelegateEngine captures a contract that appears after twenty terminal rere
 		});
 		assert.equal(result.status, "DONE");
 		assert.equal(result.completion?.summary, "late non-Pi refresh");
-		assert.equal(gateway.calls.filter((call) => call === "read").length, 21);
+		assert.equal(gateway.calls.filter((call) => call === "read").length, 22);
 		assert.equal(delays.length, 20);
 	} finally {
 		await rm(root, { recursive: true, force: true });
@@ -343,7 +440,7 @@ test("DelegateEngine falls back to the exact Pi session when Herdr terminal rows
 		});
 		assert.equal(result.status, "DONE");
 		assert.equal(result.completion?.summary, "session fallback completed");
-		assert.equal(gateway.calls.filter((call) => call === "read").length, 1);
+		assert.equal(gateway.calls.filter((call) => call === "read").length, 2);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

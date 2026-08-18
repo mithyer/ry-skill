@@ -58,7 +58,8 @@ rollback material and is not registered as an active Pi skill.
 | Pipeline submission | Persists a complete request and FIFO inbox entry, then returns `QUEUED` or bounded-ack `ACCEPTED` without waiting for stage completion. |
 | Coordinator | Uses one project/workspace-bound long-lived Pi pane, exact session binding, bounded ready-wave stage ticks, workspace reservations/leases/fences/layout locks, stage-specific JSONL logs, answer/stop controls, and closed-pane exact-session recovery. Legacy stages remain serial. |
 | Communication | JSONL/NDJSON is the sole runtime source of truth. Child agents read relay-designated events; the parent/coordinator owns validation and writes. No Codex/Claude communication plugin is required. |
-| Herdr boundary | All delegate side effects pass through `HerdrCliGateway`, which uses argv arrays, explicit `cwd`/environment, cancellation/timeout, and captured stdout/stderr. |
+| Herdr boundary | All delegate side effects pass through `HerdrCliGateway`, which uses argv arrays, explicit `cwd`/environment, cancellation/timeout, and captured stdout/stderr. Formal task relay uses `wait: false`; `AgentTurnMonitor` separately polls exact identity, transport hints, terminal output, and completion contracts. |
+| Monitoring | Leaf and pipeline stages share `ry-herdr-delegate/agent-monitor.ts`; relay baselines, observations, bounded PARTIAL outcomes, exact Pi fallback, and late reconciliation are persisted in JSONL without resending or replacing exact sessions. |
 | Recovery | Open-pane reuse and definitively closed-pane resume require the complete `agent_session` identity. Unknown or mismatched state returns `BLOCKED` or `PARTIAL`; generic latest-session fallback is not used. |
 
 The structured tool supports these actions:
@@ -89,7 +90,7 @@ Pi uses its normal arguments.
 The default leaf pane policy is `new-tab`. After semantic `DONE`, the runtime
 creates a non-focused tab named `closed-pane-<communicationId>` and moves the
 completed child pane there. `close` and `keep` are explicit alternatives.
-Incomplete outcomes preserve the pane when possible. A recognized child-side cancellation marker such as `Conversation interrupted` is reported as `PARTIAL` with the child preserved; other missing or invalid completion contracts remain `ERROR`.
+Incomplete outcomes preserve the pane when possible. A recognized child-side cancellation marker such as `Conversation interrupted` is reported as `PARTIAL` with the child preserved; a missing contract after the monitor budget is also `PARTIAL`, while a valid `STATUS: ERROR` contract or explicit transport failure remains `ERROR`.
 
 #### Debug Logging
 
@@ -147,16 +148,21 @@ The extension does not silently fall back to the old skill, an external
 `ry_herdr_delegate_tool` and reports its structured status. It is an execution
 command, not a status-only command. Explicit directives such as `用codex` or
 `使用 Claude` are honored; otherwise review or research tasks use Claude,
-implementation and validation tasks use Codex, and other tasks use Pi. Manual
-slash tasks selected for an external worker receive a 10-minute command budget
-so long-running builds are not cut off by the ordinary 180-second default.
-The slash prompt and the final agent conclusion are persisted as TUI-only
-session entries, so the command remains visible without triggering a second
-parent-model turn. The conclusion includes the resolved agent, work summary,
-validation, changed files, and remaining risks when reported. While an
-unresolved child is being monitored, the parent status shows an ASCII spinner;
-semantic `DONE` stops and clears the direct monitor surfaces after the
-conclusion is written.
+implementation and validation tasks, including source-symbol requests such as
+`ExerciseDetailsSharedViewControllerV2 ...`, use Codex, and other tasks use Pi.
+Every manual slash task receives a 10-minute command budget so long-running
+builds are not cut off by the ordinary 180-second default. The slash prompt and
+the final agent conclusion are persisted as TUI-only session entries, so the
+command remains visible without triggering a second parent-model turn. The
+conclusion includes the resolved agent, work summary, validation, changed files,
+and remaining risks when reported. If a direct leaf returned `PARTIAL` because
+its parent wait ended, the monitor may reconcile only an unchanged exact local
+Pi session by matching the original communication file and relay message ID; it
+never resends the task, starts a replacement child, or accepts a mismatched
+session. A verified late completion appends a `reconciliation-result` JSONL event and final
+conclusion, then stops the monitor. While an unresolved child is being
+monitored, the parent status shows an ASCII spinner; semantic `DONE` stops and
+clears the direct monitor surfaces after the conclusion is written.
 
 Before the model loop, the extension also detects an explicit actionable agent
 directive such as `请使用 codex 修复这个问题`, `使用 Claude 审查这次修改`, or

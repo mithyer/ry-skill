@@ -41,6 +41,9 @@ class CoordinatorFakeGateway implements HerdrGateway {
 
 	private readonly onPrompt?: (prompt: PromptInput) => Promise<void> | void;
 	private activeChild?: HerdrAgentSnapshot;
+	private readonly children = new Map<string, HerdrAgentSnapshot>();
+	private readonly stagePrompted = new Set<string>();
+	private readonly relayText = new Map<string, string>();
 	private readonly child: HerdrAgentSnapshot = {
 		agent: "worker-stage-test",
 		status: "idle",
@@ -63,17 +66,25 @@ class CoordinatorFakeGateway implements HerdrGateway {
 		this.calls.push(`start:${input.kind}`);
 		this.startArgs.push(input);
 		if (input.kind === "pi") return this.agent;
-		this.activeChild = { ...this.child, agent: input.name };
-		return this.activeChild;
+		const index = this.children.size;
+		const child = {
+			...this.child,
+			agent: input.name,
+			paneId: index === 0 ? this.child.paneId : `w-test:p-stage-${index + 1}`,
+			agentSession: { ...this.child.agentSession!, value: index === 0 ? this.child.agentSession!.value : `stage-session-${index + 1}` },
+		};
+		this.children.set(input.name, child);
+		this.activeChild = child;
+		return child;
 	}
-	async prompt(input: PromptInput): Promise<HerdrAgentSnapshot | undefined> { this.calls.push(`prompt:${input.text.split("\n")[0]}`); if (input.target !== this.agent.agent) return this.activeChild; await this.onPrompt?.(input); return this.agent; }
-	async waitFor(_input: WaitInput): Promise<HerdrAgentSnapshot> {
+	async prompt(input: PromptInput): Promise<HerdrAgentSnapshot | undefined> { this.calls.push(`prompt:${input.text.split("\n")[0]}`); if (input.target !== this.agent.agent) { this.stagePrompted.add(input.target); this.relayText.set(input.target, input.text); return this.children.get(input.target) ?? this.activeChild; } await this.onPrompt?.(input); return this.agent; }
+	async waitFor(input: WaitInput): Promise<HerdrAgentSnapshot> {
 		this.calls.push("wait");
 		this.activeWaits += 1;
 		this.maxConcurrentWaits = Math.max(this.maxConcurrentWaits, this.activeWaits);
 		if (this.waitDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, this.waitDelayMs));
 		this.activeWaits -= 1;
-		return this.activeChild ?? this.child;
+		return this.children.get(input.target) ?? this.activeChild ?? this.child;
 	}
 	async getAgent(target: string): Promise<HerdrAgentSnapshot> {
 		this.calls.push(`get:${target}`);
@@ -81,9 +92,9 @@ class CoordinatorFakeGateway implements HerdrGateway {
 			const error = Object.assign(new Error("agent not found"), { code: 404 });
 			throw error;
 		}
-		return target === this.agent.agent ? this.agent : { ...(this.activeChild ?? this.child), agent: target };
+		return target === this.agent.agent ? this.agent : this.children.get(target) ?? { ...(this.activeChild ?? this.child), agent: target };
 	}
-	async readAgent(target: string): Promise<HerdrAgentOutput> { this.calls.push(`read:${target}`); return target === this.agent.agent ? { text: "" } : { text: "STATUS: DONE\nSUMMARY: stage complete\nVALIDATION: tests passed" }; }
+	async readAgent(target: string): Promise<HerdrAgentOutput> { this.calls.push(`read:${target}`); if (target !== this.agent.agent && !this.stagePrompted.has(target)) return { text: "" }; return target === this.agent.agent ? { text: "" } : { text: `${this.relayText.get(target) ?? ""}\nSTATUS: DONE\nSUMMARY: stage complete\nVALIDATION: tests passed` }; }
 	async createTab(_input: CreateTabInput): Promise<{ tabId: string; paneId?: string }> { this.calls.push("tab"); return { tabId: "w-test:t2" }; }
 	async movePane(_input: MovePaneInput): Promise<{ tabId?: string }> { this.calls.push("move"); return { tabId: "w-test:t2" }; }
 	async closePane(_paneId: string): Promise<void> { this.calls.push("close"); }
@@ -415,6 +426,104 @@ test("PipelineCoordinator persists answer and stop controls", async () => {
 		const state = await created.store.readState(submission.pipelineId);
 		assert.equal(state.status, "DONE");
 		assert.equal(gateway.calls.includes("close"), false);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Defers one ready write stage when another stage already holds the same resource lease. */
+test("PipelineCoordinator serializes ready stages with conflicting workspace resources", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-coordinator-resource-conflict-"));
+	try {
+		const gateway = new CoordinatorFakeGateway();
+		const created = await makeCoordinator(root, gateway, {
+			version: 2,
+			pipelines: { default: { concurrency: { maxAgents: 2, maxConcurrentStages: 2 } } },
+		});
+		const submission = await created.coordinator.submit({
+			task: "run conflicting writers",
+			stages: [
+				{ stageId: "first", role: "worker", task: "first writer", dependsOn: [], resourceKeys: ["resource:shared-write"] },
+				{ stageId: "second", role: "worker", task: "second writer", dependsOn: [], resourceKeys: ["resource:shared-write"] },
+			],
+		}, root, "w-test", "w-test:p-parent", root);
+		const binding = await created.store.coordinatorStore.read();
+		assert.ok(binding);
+		const firstTick = await created.coordinator.tick(binding);
+		const firstProgress = await created.store.readProgress(submission.pipelineId, 8);
+		assert.equal(firstTick.status, "RUNNING", JSON.stringify(firstTick));
+		assert.equal(firstTick.stagesProcessed, 1);
+		assert.deepEqual(firstProgress.stages.map((stage) => stage.status), ["DONE", "QUEUED"]);
+		assert.equal(gateway.maxConcurrentWaits, 1);
+		assert.equal(gateway.calls.filter((call) => call === "start:codex").length, 1);
+		const secondTick = await created.coordinator.tick(binding);
+		assert.equal(secondTick.status, "DONE", JSON.stringify(secondTick));
+		assert.equal(gateway.calls.filter((call) => call === "start:codex").length, 2);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Keeps downstream stages queued when durable replay shows that an upstream dependency failed. */
+test("PipelineCoordinator does not run a dependent stage after its prerequisite errors", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-coordinator-failed-dependency-"));
+	try {
+		const gateway = new CoordinatorFakeGateway();
+		const created = await makeCoordinator(root, gateway);
+		const submission = await created.coordinator.submit({
+			task: "respect failed dependency",
+			stages: [
+				{ stageId: "prepare", role: "worker", task: "prepare", dependsOn: [] },
+				{ stageId: "verify", role: "worker", task: "verify", dependsOn: ["prepare"] },
+			],
+		}, root, "w-test", "w-test:p-parent", root);
+		await created.store.appendPipelineEvent(submission.pipelineId, "result", "coordinator", {
+			status: "ERROR",
+			stageId: "prepare",
+			stageIndex: 0,
+			error: "upstream failure",
+		});
+		const binding = await created.store.coordinatorStore.read();
+		assert.ok(binding);
+		const result = await created.coordinator.tick(binding);
+		const progress = await created.store.readProgress(submission.pipelineId, 8);
+		assert.equal(result.status, "ACCEPTED", JSON.stringify(result));
+		assert.deepEqual(progress.stages.map((stage) => stage.status), ["ERROR", "QUEUED"]);
+		assert.equal(gateway.calls.filter((call) => call === "start:codex").length, 0);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Rejects a stale control target before appending an authoritative control event or waking the coordinator. */
+test("PipelineCoordinator rejects a control with a stale attempt or fence", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-coordinator-stale-control-"));
+	try {
+		const gateway = new CoordinatorFakeGateway();
+		const created = await makeCoordinator(root, gateway);
+		const submission = await created.coordinator.submit({
+			task: "block one stage",
+			stages: [{ stageId: "blocked", role: "worker", task: "blocked", dependsOn: [] }],
+		}, root, "w-test", "w-test:p-parent", root);
+		await created.store.appendPipelineEvent(submission.pipelineId, "result", "coordinator", {
+			status: "BLOCKED",
+			stageId: "blocked",
+			stageIndex: 0,
+			attempt: 1,
+			fencingToken: "fence-current",
+			summary: "waiting for answer",
+		});
+		const beforePrompts = gateway.calls.filter((call) => call.startsWith("prompt:")).length;
+		const control = await created.coordinator.answer(submission.pipelineId, "continue", root, "w-test", undefined, {
+			stageId: "blocked",
+			expectedAttempt: 2,
+			expectedFence: "fence-stale",
+		});
+		const progress = await created.store.readProgress(submission.pipelineId, 8);
+		assert.equal(control.status, "BLOCKED");
+		assert.match(control.error ?? "", /expected attempt/);
+		assert.equal(progress.controlEvents?.length, 0);
+		assert.equal(gateway.calls.filter((call) => call.startsWith("prompt:")).length, beforePrompts);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

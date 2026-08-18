@@ -201,8 +201,10 @@ export function normalizePipelineStages(input: readonly PipelineStageInput[]): r
 		known.add(stageId);
 	}
 	const normalized: PipelineStageInput[] = input.map((stage, index) => {
-		const explicit = stage.dependsOn !== undefined;
-		const dependsOn = explicit ? [...stage.dependsOn!] : index === 0 ? [] : [stageIds[index - 1]!];
+		// Persisted legacy plans retain their serial compatibility mode even though replayed records include normalized dependencies.
+		const legacySerial = stage.dependencyMode === "legacy-serial";
+		const explicit = !legacySerial && (stage.dependencyMode === "explicit" || stage.dependsOn !== undefined);
+		const dependsOn = legacySerial ? (index === 0 ? [] : [stageIds[index - 1]!]) : explicit ? [...(stage.dependsOn ?? [])] : index === 0 ? [] : [stageIds[index - 1]!];
 		const dependencies = new Set<string>();
 		for (const dependency of dependsOn) {
 			if (!/^[A-Za-z][A-Za-z0-9_-]{0,127}$/.test(dependency)) throw new Error(`pipeline stage ${stageIds[index]} has an invalid dependency identity`);
@@ -676,7 +678,7 @@ export class PipelineStore {
 				applyStageMetadata(stage, payload, located.event.agentSession);
 				continue;
 			}
-			if (located.event.type === "result" || located.event.type === "error") {
+			if (located.event.type === "result" || located.event.type === "reconciliation-result" || located.event.type === "error") {
 				if (!stage) continue;
 				if (stage.cancelledSeq !== undefined && located.event.seq > stage.cancelledSeq) {
 					stage.staleEventCount = (stage.staleEventCount ?? 0) + 1;
@@ -740,7 +742,7 @@ export class PipelineStore {
 				}
 				if (typeof payload.currentStage === "string") currentStage = payload.currentStage;
 			}
-			if (located.event.type === "result" || located.event.type === "error") {
+			if (located.event.type === "result" || located.event.type === "reconciliation-result" || located.event.type === "error") {
 				if (Object.prototype.hasOwnProperty.call(payload, "stageIndex") && Number.isSafeInteger(payload.stageIndex) && typeof payload.status === "string" && isPipelineStatus(payload.status)) stageStatuses.set(payload.stageIndex as number, payload.status);
 				if (!Object.prototype.hasOwnProperty.call(payload, "stageIndex") && typeof payload.status === "string" && isPipelineStatus(payload.status)) {
 					hasTopLevelStatus = true;

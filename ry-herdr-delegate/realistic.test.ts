@@ -46,6 +46,7 @@ function agentRecord(status: "idle" | "done", includeSession: boolean): Record<s
 function createScenario(sessionVisibleAfter: number): { spawnProcess: SpawnProcess; calls: string[][]; getAttempts: () => number } {
 	const calls: string[][] = [];
 	let getAttempts = 0;
+	let formalRelaySubmitted = false;
 	const spawnProcess: SpawnProcess = (_command, args, _options: SpawnOptions) => {
 		calls.push([...args]);
 		const [scope, operation] = args;
@@ -75,13 +76,15 @@ function createScenario(sessionVisibleAfter: number): { spawnProcess: SpawnProce
 			return fakeChild(JSON.stringify({ result: { agent: agentRecord("idle", getAttempts >= sessionVisibleAfter) } }));
 		}
 		if (scope === "agent" && operation === "prompt") {
+			const text = args[3] ?? "";
+			if (text.includes("COMMUNICATION FILE:")) formalRelaySubmitted = true;
 			return fakeChild(JSON.stringify({ result: { agent: agentRecord("idle", true) } }));
 		}
 		if (scope === "agent" && operation === "wait") {
 			return fakeChild(JSON.stringify({ result: { agent: agentRecord("done", true) } }));
 		}
 		if (scope === "agent" && operation === "read") {
-			return fakeChild("STATUS: DONE\nSUMMARY: realistic Claude call completed\nVALIDATION: simulated Herdr CLI path passed\n");
+			return fakeChild(formalRelaySubmitted ? "STATUS: DONE\nSUMMARY: realistic Claude call completed\nVALIDATION: simulated Herdr CLI path passed\n" : "");
 		}
 		if (scope === "pane" && operation === "move") {
 			return fakeChild(JSON.stringify({ result: { tab: { tab_id: "w-test:t2" } } }));
@@ -126,14 +129,14 @@ test("realistic Claude delegate completes through the Herdr CLI boundary", async
 		assert.equal(result.status, "DONE");
 		assert.equal(result.agent, "worker-realistic");
 		assert.deepEqual(result.agentSession, CHILD_SESSION);
-		assert.equal(scenario.getAttempts(), 2);
+		assert.equal(scenario.getAttempts(), 3);
 		assert.equal(scenario.calls.filter(([scope, operation]) => scope === "agent" && operation === "start").length, 1);
 		const promptCalls = scenario.calls.filter(([scope, operation]) => scope === "agent" && operation === "prompt");
 		assert.equal(promptCalls.length, 2);
 		assert.match(promptCalls[0][3] ?? "", /^RY_HERDR_SESSION_BOOTSTRAP:/);
 		assert.match(promptCalls[1][3] ?? "", /COMMUNICATION FILE:/);
 		assert.equal(scenario.calls.filter(([scope, operation]) => scope === "agent" && operation === "wait").length, 1);
-		assert.equal(scenario.calls.filter(([scope, operation]) => scope === "agent" && operation === "read").length, 1);
+		assert.equal(scenario.calls.filter(([scope, operation]) => scope === "agent" && operation === "read").length, 2);
 		assert.deepEqual(scenario.calls.at(-1), ["pane", "move", "w-test:p2", "--new-tab", `--label`, `closed-pane-${result.communicationId}`, "--workspace", "w-test", "--no-focus"]);
 		const events = (await readEventLog(result.communicationFile)).events.map(({ event }) => event.type);
 		assert.deepEqual(events.slice(-2), ["result", "pane-disposition"]);

@@ -747,6 +747,7 @@ export class PipelineCoordinator {
 			role: input.role,
 			overrides: { agent: input.agent, effort: input.effort, extraArgs: input.extraArgs, cwd: input.cwd ?? binding.cwd, timeoutMs: input.timeoutMs, panePolicy: input.panePolicy ?? claim.progress.request.panePolicy },
 			transaction: claim.entry.pipelineId,
+			stageId: claim.stageId,
 			stageOccurrence: claim.stageIndex + 1,
 			previousCommunication: stage.communicationFile,
 			communicationFile: stage.communicationFile ?? join(this.dependencies.pipelineStore.coordinatorStore.stateDirectory, "communications", `${claim.entry.pipelineId}-${claim.stageId}-attempt-${claim.attempt}.jsonl`),

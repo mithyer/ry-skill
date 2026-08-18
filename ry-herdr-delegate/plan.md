@@ -1,8 +1,8 @@
 # ry-herdr-delegate 实施计划
 
-> 状态：Phase 0-4 的主要 runtime 路径、pipeline recovery 和发布前自动化硬化已落地；并发 vertical slice 已进入实现，仍需完成最终控制/replay、崩溃恢复、live smoke 和 release gate。
+> 状态：Phase 0-4 的主要 runtime 路径、pipeline recovery、并发 vertical slice 和共享 AgentTurnMonitor 已在 dirty worktree 落地；仍需完成 live smoke、发布硬化和最终 release gate。
 >
-> 修复工作流专项计划见 [repair-workflow-plan.md](./repair-workflow-plan.md)；当前仅为提案，尚未进入 runtime 实现。
+> 修复工作流专项计划见 [repair-workflow-plan.md](./repair-workflow-plan.md)；外部 Agent 监听重构方案已进入本地 runtime 实现，live smoke 和发布验证仍待完成。
 >
 ## 1. 当前基线
 
@@ -12,6 +12,7 @@
 | `ry-herdr-fork` / `ry-herdr-clone` | 已直接调用 standalone `herdr` CLI，有共享启动器和测试 | 不改行为，只参考 `CommandExecutor`、错误处理和 fake 测试模式 |
 | package manifest | 已注册 delegate extension，并从 `pi.skills` 移除 active delegate Skill | 保持单一 delegation owner，并验证安装后 tool discovery |
 | Herdr | 目标运行时为 Herdr 0.8+ | 先做 capability probe，未验证的命令和 JSON shape 不得进入 engine |
+| Agent monitor | `agent-monitor.ts` 已统一 leaf/pipeline 的 relay 后观察、exact identity、baseline、terminal capture、bounded PARTIAL 和 Pi fallback | 继续补 gateway/monitor 回归、live smoke 与 release gate |
 | 设计文档 | `design.md` 已定义 coordinator、JSONL event log、exact session 和 pane policy | 作为实现 contract；本文件只负责落地顺序 |
 
 ## 2. 目标与非目标

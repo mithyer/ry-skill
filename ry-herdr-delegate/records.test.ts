@@ -45,6 +45,32 @@ test("JSONL event store appends, replays, redacts, and deduplicates", async () =
 	}
 });
 
+/** Checks resultKey idempotency ignores generated event identity but rejects semantic conflicts. */
+test("JSONL result events deduplicate by resultKey", async () => {
+	const root = await mkdtemp(join(tmpdir(), "ry-herdr-records-result-key-"));
+	const file = join(root, "result.jsonl");
+	const base: NewJsonlEvent = {
+		schemaVersion: 2,
+		eventId: "result-1",
+		timestamp: "2026-08-12T00:00:00.000Z",
+		type: "result",
+		actor: "child-output-capture",
+		transaction: "tx-result",
+		stageRole: "worker",
+		stageOccurrence: 1,
+		payload: { resultKey: "[\"tx-result\",\"stage-1\",1,1,\"fence\",\"relay\"]", status: "DONE", summary: "same", validation: "passed" },
+	};
+	try {
+		await appendEvent(file, base);
+		const retry = await appendEvent(file, { ...base, eventId: "result-2", timestamp: "2026-08-12T00:01:00.000Z" });
+		assert.equal(retry.idempotent, true);
+		await assert.rejects(appendEvent(file, { ...base, eventId: "result-3", payload: { ...base.payload, summary: "different" } }), /result idempotency conflict/);
+		assert.equal((await readEventLog(file)).events.length, 1);
+	} finally {
+		await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true }));
+	}
+});
+
 /** Checks conflicting event identities fail without appending another line. */
 test("JSONL event store rejects idempotency conflicts", async () => {
 	const root = await mkdtemp(join(tmpdir(), "ry-herdr-record-conflict-"));
