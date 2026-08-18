@@ -201,6 +201,20 @@ test("AgentTurnMonitor rejects a foreign relay marker despite changed output", a
 	assert.equal(result.completion, undefined);
 });
 
+/** Verifies continuations tolerate terminal line wrapping without accepting a foreign relay. */
+// TEST:agent-monitor.test.ts[AgentTurnMonitor accepts terminal-wrapped current relay markers]
+test("AgentTurnMonitor accepts terminal-wrapped current relay markers", async () => {
+	const input = monitorInput({ requireRelayAnchor: true });
+	const wrappedCommunicationFile = input.communicationFile.replace("/tmp/", "/\n  tmp/");
+	const gateway = new MonitorFakeGateway([
+		`MESSAGE ID: ${input.relayMessageId}\nCOMMUNICATION FILE: ${wrappedCommunicationFile}\nSTATUS: DONE\nSUMMARY: wrapped continuation\nVALIDATION: marker matching`,
+	]);
+	const result = await new AgentTurnMonitor({ gateway, maxAttempts: 1, sleep: async () => undefined }).observe(input);
+
+	assert.equal(result.status, "DONE");
+	assert.equal(result.completion?.summary, "wrapped continuation");
+});
+
 /** Verifies a continuation cannot accept changed unanchored terminal output. */
 test("AgentTurnMonitor requires the current relay anchor for continuations", async () => {
 	const gateway = new MonitorFakeGateway(["STATUS: DONE\nSUMMARY: stale continuation\nVALIDATION: stale"]);

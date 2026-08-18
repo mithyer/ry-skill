@@ -197,18 +197,33 @@ function interruptedCompletion(): CompletionContract {
 	return { ...errorCompletionContract(new Error("Child conversation was interrupted before completion contract")), status: "PARTIAL" };
 }
 
-/** Returns whether a capture contains both current relay pointers. */
-function hasRelayAnchor(text: string, input: AgentTurnObservationInput): boolean {
-	return text.includes(`MESSAGE ID: ${input.relayMessageId}`) && text.includes(`COMMUNICATION FILE: ${input.communicationFile}`);
+/** Builds a whitespace-tolerant pattern for a terminal-wrapped relay marker. */
+function relayMarkerPattern(label: string, value: string): RegExp {
+	const compactMarker = `${label}:${value}`.replace(/\s+/g, "");
+	const pattern = [...compactMarker].map((character) => `${character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`).join("");
+	return new RegExp(pattern, "i");
 }
 
-/** Narrows terminal parsing to the current relay and rejects visible foreign relay markers. */
+/** Finds a relay marker even when terminal rendering inserts whitespace or line breaks. */
+function findRelayMarker(text: string, label: string, value: string): number {
+	return text.search(relayMarkerPattern(label, value));
+}
+
+/** Returns whether a capture contains both current relay pointers.
+ * TEST:agent-monitor.test.ts[AgentTurnMonitor accepts terminal-wrapped current relay markers]
+ */
+function hasRelayAnchor(text: string, input: AgentTurnObservationInput): boolean {
+	return relayMarkerPattern("MESSAGE ID", input.relayMessageId).test(text)
+		&& relayMarkerPattern("COMMUNICATION FILE", input.communicationFile).test(text);
+}
+
+/** Narrows terminal parsing to the current relay and rejects visible foreign relay markers.
+ * TEST:agent-monitor.test.ts[AgentTurnMonitor rejects a foreign relay marker despite changed output]
+ */
 function currentRelayOutput(text: string, input: AgentTurnObservationInput): string | undefined {
-	const messageMarker = `MESSAGE ID: ${input.relayMessageId}`;
-	const fileMarker = `COMMUNICATION FILE: ${input.communicationFile}`;
-	const messageIndex = text.indexOf(messageMarker);
-	const fileIndex = text.indexOf(fileMarker);
-	const hasAnyMessageMarker = /MESSAGE ID:\s*\S+/.test(text);
+	const messageIndex = findRelayMarker(text, "MESSAGE ID", input.relayMessageId);
+	const fileIndex = findRelayMarker(text, "COMMUNICATION FILE", input.communicationFile);
+	const hasAnyMessageMarker = /MESSAGE\s*ID\s*:/i.test(text);
 	if (input.requireRelayAnchor && !hasRelayAnchor(text, input)) return undefined;
 	if (hasAnyMessageMarker && !hasRelayAnchor(text, input)) return undefined;
 	if (messageIndex < 0 && fileIndex < 0) return text;
