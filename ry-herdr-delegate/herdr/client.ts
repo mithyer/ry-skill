@@ -544,7 +544,7 @@ export class HerdrCliGateway implements HerdrGateway {
 	async prompt(input: PromptInput): Promise<HerdrAgentSnapshot | undefined> {
 		const args = ["agent", "prompt", input.target, input.text];
 		if (input.wait) args.push("--wait");
-		if (input.timeoutMs !== undefined) args.push("--timeout", String(input.timeoutMs));
+		if (input.wait && input.timeoutMs !== undefined) args.push("--timeout", String(input.timeoutMs));
 		try {
 			const result = await this.runJson(args, input.signal, input.timeoutMs ?? this.timeoutMs);
 			try {

@@ -108,6 +108,8 @@ test("HerdrCliGateway uses the validated spawn boundary", async () => {
 	assert.equal(prompted?.paneId, "w-test:p2");
 	const waited = await gateway.waitFor({ target: started.agent, until: ["idle", "done"], timeoutMs: 25 });
 	assert.equal(waited.agentSession?.value, "session-test");
+	const fireAndForget = await gateway.prompt({ target: started.agent, text: "relay-no-wait", wait: false, timeoutMs: 25 });
+	assert.equal(fireAndForget?.agentSession?.value, "session-test");
 	const output = await gateway.readAgent(started.agent);
 	assert.equal(output.text, "terminal output\n");
 	await gateway.movePane({
@@ -131,6 +133,9 @@ test("HerdrCliGateway uses the validated spawn boundary", async () => {
 	assert.ok(promptCall);
 	assert.deepEqual(promptCall.args.slice(0, 3), ["agent", "prompt", "worker-test"]);
 	assert.deepEqual(promptCall.args.slice(-4), ["relay", "--wait", "--timeout", "25"]);
+	const noWaitPromptCall = calls.find((call) => call.args[0] === "agent" && call.args[1] === "prompt" && call.args[3] === "relay-no-wait");
+	assert.ok(noWaitPromptCall);
+	assert.deepEqual(noWaitPromptCall.args, ["agent", "prompt", "worker-test", "relay-no-wait"]);
 	const waitCall = calls.find((call) => call.args[0] === "agent" && call.args[1] === "wait");
 	assert.ok(waitCall);
 	assert.deepEqual(waitCall.args.slice(-6), ["--until", "idle", "--until", "done", "--timeout", "25"]);
