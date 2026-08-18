@@ -237,6 +237,7 @@ test("HerdrCliGateway retries transient agent_not_idle terminal reads", async ()
 /** Verifies startup establishes a missing external session before the real relay can be sent. */
 test("HerdrCliGateway bootstraps delayed agent_session metadata", async () => {
 	const calls: SpawnCall[] = [];
+	const delays: number[] = [];
 	let getAttempts = 0;
 	const spawnProcess: SpawnProcess = (command, args, options) => {
 		calls.push({ command, args: [...args], options });
@@ -266,7 +267,7 @@ test("HerdrCliGateway bootstraps delayed agent_session metadata", async () => {
 		command: "herdr-test",
 		cwd: "/tmp/project",
 		spawnProcess,
-		sleep: async () => undefined,
+		sleep: async (milliseconds) => { delays.push(milliseconds); },
 	});
 	const started = await gateway.startAgent({ name: "worker-test", kind: "codex", paneId: "w-test:p2", agentArgs: ["--yolo"] });
 	assert.equal(started.agentSession?.value, "bootstrapped-session");
@@ -274,8 +275,45 @@ test("HerdrCliGateway bootstraps delayed agent_session metadata", async () => {
 	const bootstrapCall = calls.find((call) => call.args[0] === "agent" && call.args[1] === "prompt");
 	assert.ok(bootstrapCall);
 	assert.match(String(bootstrapCall.args[3]), /^RY_HERDR_SESSION_BOOTSTRAP:/);
-	assert.deepEqual(bootstrapCall.args.slice(-3), ["--wait", "--timeout", "10000"]);
+	assert.deepEqual(bootstrapCall.args, ["agent", "prompt", "worker-test", "RY_HERDR_SESSION_BOOTSTRAP: Do not modify files, run commands, or delegate. Reply exactly: READY"]);
+	const bootstrapEnterCall = calls.find((call) => call.args[0] === "agent" && call.args[1] === "send-keys");
+	assert.ok(bootstrapEnterCall);
+	assert.deepEqual(bootstrapEnterCall.args, ["agent", "send-keys", "worker-test", "ENTER"]);
+	assert.deepEqual(delays, [10_000, 1_000]);
 });
+/** Verifies a second fixed bootstrap is allowed when the first session publication remains missing. */
+// TEST:herdr.test.ts[HerdrCliGateway retries a missing-session bootstrap once]
+test("HerdrCliGateway retries a missing-session bootstrap once", async () => {
+	const calls: SpawnCall[] = [];
+	const delays: number[] = [];
+	let getAttempts = 0;
+	const spawnProcess: SpawnProcess = (command, args, options) => {
+		calls.push({ command, args: [...args], options });
+		if (args[0] === "agent" && args[1] === "get") {
+			getAttempts += 1;
+			const session = getAttempts > 31 ? { agent_session: { kind: "id", source: "herdr:codex", value: "retried-session" } } : {};
+			return fakeChild(JSON.stringify({ result: { agent: { name: "worker-test", agent: "codex", agent_status: "idle", pane_id: "w-test:p2", workspace_id: "w-test", cwd: "/tmp/project", ...session } } }));
+		}
+		return fakeChild(JSON.stringify({ result: { ok: true } }));
+	};
+	const gateway = new HerdrCliGateway({
+		command: "herdr-test",
+		cwd: "/tmp/project",
+		spawnProcess,
+		sleep: async (milliseconds) => { delays.push(milliseconds); },
+	});
+
+	const started = await gateway.startAgent({ name: "worker-test", kind: "codex", paneId: "w-test:p2", agentArgs: ["--yolo"] });
+
+	assert.equal(started.agentSession?.value, "retried-session");
+	assert.equal(getAttempts, 32);
+	assert.equal(calls.filter((call) => call.args[0] === "agent" && call.args[1] === "prompt").length, 2);
+	assert.equal(calls.filter((call) => call.args[0] === "agent" && call.args[1] === "send-keys").length, 2);
+	assert.deepEqual(delays.slice(0, 2), [10_000, 1_000]);
+	assert.equal(delays.filter((delay) => delay === 100).length, 29);
+	assert.deepEqual(delays.slice(-3), [1_000, 10_000, 1_000]);
+});
+
 /** Reports command failures with captured evidence. */
 test("HerdrCliGateway reports command failures with captured evidence", async () => {
 	const spawnProcess: SpawnProcess = (_command, _args, _options) => fakeChild("", 7, "SIGTERM");

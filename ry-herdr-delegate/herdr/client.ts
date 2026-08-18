@@ -63,6 +63,18 @@ const AGENT_SESSION_BOOTSTRAP_TIMEOUT_MS = 10_000;
 /** Fixed no-op prompt used only to make an external session identity observable before task relay. */
 const AGENT_SESSION_BOOTSTRAP_PROMPT = "RY_HERDR_SESSION_BOOTSTRAP: Do not modify files, run commands, or delegate. Reply exactly: READY";
 
+/** Delay allowing a newly launched external CLI to render an interactive prompt. */
+const AGENT_SESSION_BOOTSTRAP_READY_DELAY_MS = 10_000;
+
+/** Maximum fixed READY bootstrap submissions allowed before startup fails closed. */
+const AGENT_SESSION_BOOTSTRAP_ATTEMPTS = 2;
+
+/** Delay between fixed READY bootstrap submissions after missing session metadata. */
+const AGENT_SESSION_BOOTSTRAP_RETRY_DELAY_MS = 1_000;
+
+/** Delay allowing Herdr to inject the bootstrap prompt before submitting Enter. */
+const AGENT_SESSION_BOOTSTRAP_SUBMIT_DELAY_MS = 1_000;
+
 /** Structured error raised when Herdr cannot satisfy a CLI capability. */
 export class HerdrCapabilityError extends Error {
 	/** CLI argument vector associated with the unsupported operation. */
@@ -485,13 +497,18 @@ export class HerdrCliGateway implements HerdrGateway {
 			timeoutMs: AGENT_SESSION_BOOTSTRAP_TIMEOUT_MS,
 		});
 		try {
+			// Herdr 0.8 may leave Codex's READY text in the editable prompt when --wait is used.
+			// Submit the fixed bootstrap explicitly so the child publishes agent_session.
+			await this.sleep(AGENT_SESSION_BOOTSTRAP_READY_DELAY_MS);
 			await this.prompt({
 				target,
 				text: AGENT_SESSION_BOOTSTRAP_PROMPT,
-				wait: true,
+				wait: false,
 				timeoutMs: AGENT_SESSION_BOOTSTRAP_TIMEOUT_MS,
 				signal,
 			});
+			await this.sleep(AGENT_SESSION_BOOTSTRAP_SUBMIT_DELAY_MS);
+			await this.runJson(["agent", "send-keys", target, "ENTER"], signal, AGENT_SESSION_BOOTSTRAP_TIMEOUT_MS);
 			await this.debugLogger.log("herdr.agent.session.bootstrap.result", { target });
 		} catch (error) {
 			// Onboarding or authentication can block the probe; the caller still fails closed below.
@@ -518,8 +535,22 @@ export class HerdrCliGateway implements HerdrGateway {
 				await this.runJson(args, input.signal);
 				const initial = await this.getAgent(input.name, input.signal);
 				if (initial.agentSession) return initial;
-				await this.bootstrapAgentSession(input.name, input.signal);
-				return this.getStartedAgent(input.name, input.signal);
+				let started = initial;
+				for (let bootstrapAttempt = 1; bootstrapAttempt <= AGENT_SESSION_BOOTSTRAP_ATTEMPTS; bootstrapAttempt += 1) {
+					await this.bootstrapAgentSession(input.name, input.signal);
+					started = await this.getStartedAgent(input.name, input.signal);
+					if (started.agentSession) return started;
+					if (bootstrapAttempt < AGENT_SESSION_BOOTSTRAP_ATTEMPTS) {
+						await this.debugLogger.log("herdr.agent.session.bootstrap.retry", {
+							target: input.name,
+							attempt: bootstrapAttempt,
+							maxAttempts: AGENT_SESSION_BOOTSTRAP_ATTEMPTS,
+							retryMs: AGENT_SESSION_BOOTSTRAP_RETRY_DELAY_MS,
+						}, "warn");
+						await this.sleep(AGENT_SESSION_BOOTSTRAP_RETRY_DELAY_MS);
+					}
+				}
+				return started;
 			} catch (error) {
 				if (!isTransientAgentPaneBusy(error) || attempt === AGENT_START_ATTEMPTS) throw error;
 				await this.debugLogger.log("herdr.agent.start.retry", {

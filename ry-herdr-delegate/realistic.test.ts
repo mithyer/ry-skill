@@ -160,8 +160,8 @@ test("realistic Claude delegate fails closed when session metadata never appears
 		assert.equal(result.status, "BLOCKED");
 		assert.equal(result.error, "Herdr did not return exact agent_session metadata");
 		const promptCalls = scenario.calls.filter(([scope, operation]) => scope === "agent" && operation === "prompt");
-		assert.equal(promptCalls.length, 1);
-		assert.match(promptCalls[0][3] ?? "", /^RY_HERDR_SESSION_BOOTSTRAP:/);
+		assert.equal(promptCalls.length, 2);
+		assert.ok(promptCalls.every((call) => /^RY_HERDR_SESSION_BOOTSTRAP:/.test(call[3] ?? "")));
 		assert.equal(scenario.calls.some(([scope, operation]) => scope === "agent" && operation === "read"), false);
 		assert.equal(scenario.calls.some(([scope, operation]) => scope === "pane" && operation === "move"), false);
 	} finally {
