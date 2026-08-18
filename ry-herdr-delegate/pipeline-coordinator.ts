@@ -686,7 +686,7 @@ export class PipelineCoordinator {
 						deferred ??= { status: "BLOCKED", pipelineId: entry.pipelineId, communicationFile: progress.state.communicationFile, currentStage: stage.role, error: message };
 						continue;
 					}
-					const profile = resolveAgentProfile(this.dependencies.config, input.role, { agent: input.agent, effort: input.effort, extraArgs: input.extraArgs, cwd: stageCwd, timeoutMs: input.timeoutMs, panePolicy: input.panePolicy }, this.dependencies.capabilities);
+					const profile = resolveAgentProfile(this.dependencies.config, input.role, { agent: input.agent, model: input.model, effort: input.effort, extraArgs: input.extraArgs, cwd: stageCwd, timeoutMs: input.timeoutMs, panePolicy: input.panePolicy }, this.dependencies.capabilities);
 					const now = Date.now();
 					const resolvedTimeoutMs = profile.timeoutMs;
 					const deadlineAt = new Date(now + resolvedTimeoutMs + requestPolicy.startupGraceMs + requestPolicy.captureGraceMs + requestPolicy.controlMarginMs).toISOString();
@@ -745,7 +745,7 @@ export class PipelineCoordinator {
 			action: "delegate",
 			task,
 			role: input.role,
-			overrides: { agent: input.agent, effort: input.effort, extraArgs: input.extraArgs, cwd: input.cwd ?? binding.cwd, timeoutMs: input.timeoutMs, panePolicy: input.panePolicy ?? claim.progress.request.panePolicy },
+			overrides: { agent: input.agent, model: input.model, effort: input.effort, extraArgs: input.extraArgs, cwd: input.cwd ?? binding.cwd, timeoutMs: input.timeoutMs, panePolicy: input.panePolicy ?? claim.progress.request.panePolicy },
 			transaction: claim.entry.pipelineId,
 			stageId: claim.stageId,
 			stageOccurrence: claim.stageIndex + 1,

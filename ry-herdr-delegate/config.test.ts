@@ -26,6 +26,31 @@ test("configuration preserves explicit autonomy opt-out", () => {
 	assert.deepEqual(profile.extraArgs, []);
 });
 
+/** Verifies model precedence and `{model}` expansion for role and invocation overrides. */
+test("configuration resolves role and invocation model overrides", () => {
+	const config = parseDelegateConfig({
+		version: 2,
+		agents: {
+			codex: {
+				model: "profile-model",
+				modelArgs: ["--model", "{model}"],
+			},
+		},
+		roles: {
+			scout: {
+				agent: "codex",
+				model: "role-model",
+			},
+		},
+	});
+	const roleProfile = resolveAgentProfile(config, "scout");
+	assert.equal(roleProfile.model, "role-model");
+	assert.deepEqual(roleProfile.modelArgs, ["--model", "role-model"]);
+	const invocationProfile = resolveAgentProfile(config, "scout", { model: "invocation-model" });
+	assert.equal(invocationProfile.model, "invocation-model");
+	assert.deepEqual(invocationProfile.modelArgs, ["--model", "invocation-model"]);
+});
+
 /** Checks unknown fields and unsupported roles fail before a gateway call. */
 test("configuration rejects typos and unsupported roles", () => {
 	assert.throws(() => parseDelegateConfig({ version: 1, defaults: { panePolciy: "keep" } }), /unknown field/);

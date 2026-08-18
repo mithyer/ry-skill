@@ -44,13 +44,16 @@
   "roles": {
     "scout": {
       "agent": "codex",
+      "model": null,
       "effort": "low"
     },
     "researcher": {
-      "agent": "claude"
+      "agent": "claude",
+      "model": null
     },
     "worker": {
       "agent": "codex",
+      "model": null,
       "effort": "high",
       "timeoutMs": 300000,
       "panePolicy": "new-tab",
@@ -58,14 +61,17 @@
     },
     "reviewer": {
       "agent": "claude",
+      "model": null,
       "timeoutMs": 240000
     },
     "oracle": {
       "agent": "pi",
+      "model": null,
       "effort": "medium"
     },
     "delegate": {
       "agent": "pi",
+      "model": null,
       "effort": "medium"
     }
   },

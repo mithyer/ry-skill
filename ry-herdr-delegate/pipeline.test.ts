@@ -42,6 +42,7 @@ test("PipelineStore round-trips a normalized default stage and inbox pointer", a
 			context: {
 				role: "reviewer",
 				agent: "claude",
+				model: "claude-model",
 				effort: "high",
 				extraArgs: ["--fixture"],
 				cwd: "docs",
@@ -56,6 +57,7 @@ test("PipelineStore round-trips a normalized default stage and inbox pointer", a
 			stageId: "legacy-stage-0",
 			role: "reviewer",
 			agent: "claude",
+			model: "claude-model",
 			effort: "high",
 			extraArgs: ["--fixture"],
 			cwd: "docs",

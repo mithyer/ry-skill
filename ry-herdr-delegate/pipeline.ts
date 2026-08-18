@@ -785,11 +785,12 @@ function defaultPipelineStage(context: Record<string, unknown>, panePolicy: Pane
 	const role = typeof context.role === "string" && context.role.trim() ? context.role : "worker";
 	if (!isSupportedRole(role)) throw new Error(`pipeline default stage role is not configured or supported: ${role}`);
 	const agent = context.agent === "codex" || context.agent === "claude" || context.agent === "pi" ? context.agent : undefined;
+	const model = typeof context.model === "string" && context.model.trim() ? context.model : undefined;
 	const effort = typeof context.effort === "string" && context.effort.trim() ? context.effort : undefined;
 	const extraArgs = Array.isArray(context.extraArgs) && context.extraArgs.every((item) => typeof item === "string") ? context.extraArgs as string[] : undefined;
 	const timeoutMs = typeof context.timeoutMs === "number" && Number.isSafeInteger(context.timeoutMs) && context.timeoutMs > 0 ? context.timeoutMs : undefined;
 	const cwd = typeof context.cwd === "string" && context.cwd.trim() ? context.cwd : undefined;
-	return { role, ...(agent ? { agent } : {}), ...(effort ? { effort } : {}), ...(extraArgs ? { extraArgs } : {}), ...(cwd ? { cwd } : {}), ...(timeoutMs ? { timeoutMs } : {}), panePolicy };
+	return { role, ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(extraArgs ? { extraArgs } : {}), ...(cwd ? { cwd } : {}), ...(timeoutMs ? { timeoutMs } : {}), panePolicy };
 }
 
 /** Validates stage cwd and cwd resource declarations against the project root. */
@@ -819,13 +820,14 @@ function parsePanePolicy(value: unknown, path: string): PanePolicy {
 function parsePipelineStage(value: unknown, path: string): PipelineStageInput {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${path} must be an object`);
 	const input = value as Record<string, unknown>;
-	const allowed = new Set(["stageId", "role", "task", "agent", "effort", "extraArgs", "cwd", "timeoutMs", "panePolicy", "dependsOn", "access", "resourceKeys", "failFast", "maxConcurrentStages", "dependencyMode"]);
+	const allowed = new Set(["stageId", "role", "task", "agent", "model", "effort", "extraArgs", "cwd", "timeoutMs", "panePolicy", "dependsOn", "access", "resourceKeys", "failFast", "maxConcurrentStages", "dependencyMode"]);
 	for (const key of Object.keys(input)) if (!allowed.has(key)) throw new Error(`${path}.${key} is an unknown field`);
 	if (input.stageId !== undefined && (typeof input.stageId !== "string" || !/^[A-Za-z][A-Za-z0-9_-]{0,127}$/.test(input.stageId))) throw new Error(`${path}.stageId must be a stable identifier`);
 	if (typeof input.role !== "string" || !input.role.trim()) throw new Error(`${path}.role must be a non-empty string`);
 	if (!isSupportedRole(input.role)) throw new Error(`${path}.role is not configured or supported`);
 	if (input.task !== undefined && (typeof input.task !== "string" || !input.task.trim())) throw new Error(`${path}.task must be a non-empty string`);
 	if (input.agent !== undefined && input.agent !== "codex" && input.agent !== "claude" && input.agent !== "pi") throw new Error(`${path}.agent is unsupported`);
+	if (input.model !== undefined && (typeof input.model !== "string" || !input.model.trim())) throw new Error(`${path}.model must be a non-empty string`);
 	if (input.effort !== undefined && typeof input.effort !== "string") throw new Error(`${path}.effort must be a string`);
 	if (input.extraArgs !== undefined && (!Array.isArray(input.extraArgs) || input.extraArgs.some((item) => typeof item !== "string"))) throw new Error(`${path}.extraArgs must be an array of strings`);
 	if (input.cwd !== undefined && (typeof input.cwd !== "string" || !input.cwd.trim())) throw new Error(`${path}.cwd must be a non-empty string`);
@@ -842,6 +844,7 @@ function parsePipelineStage(value: unknown, path: string): PipelineStageInput {
 		role: input.role,
 		...(input.task !== undefined ? { task: input.task } : {}),
 		...(input.agent !== undefined ? { agent: input.agent } : {}),
+		...(input.model !== undefined ? { model: input.model as string } : {}),
 		...(input.effort !== undefined ? { effort: input.effort } : {}),
 		...(input.extraArgs !== undefined ? { extraArgs: input.extraArgs as string[] } : {}),
 		...(input.cwd !== undefined ? { cwd: input.cwd as string } : {}),

@@ -64,6 +64,8 @@ export interface ResolvedAgentProfile {
 export interface DelegateOverrides {
 	/** Temporarily selected agent profile. */
 	agent?: AgentKind;
+	/** Temporarily selected model override. */
+	model?: string;
 	/** Temporarily selected effort. */
 	effort?: string;
 	/** Arguments appended only for this invocation. */
@@ -100,6 +102,8 @@ export interface AgentProfileConfig {
 export interface RoleConfig {
 	/** Profile name resolved for this role. */
 	agent: AgentKind;
+	/** Optional role model override; omitted values inherit the selected agent profile. */
+	model?: string;
 	/** Optional role effort override. */
 	effort?: string;
 	/** Optional role extra arguments. */
@@ -603,8 +607,10 @@ export interface PipelineStageInput {
 	role: string;
 	/** Optional stage-specific task; otherwise the pipeline task is used. */
 	task?: string;
-	/** Invocation-local profile override. */
+	/** Invocation-local agent profile override. */
 	agent?: AgentKind;
+	/** Invocation-local model override. */
+	model?: string;
 	/** Invocation-local effort override. */
 	effort?: string;
 	/** Invocation-local extra arguments. */

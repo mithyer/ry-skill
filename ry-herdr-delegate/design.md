@@ -234,7 +234,7 @@ role override -> selected profile -> global defaults -> built-in defaults
 
 coordinator profile 必须显式定义 `model`、`effort`、`extraArgs`、`env` 和 approval/autonomy policy，不能静默继承 leaf Pi profile。`env` 只有在 Phase 0 已验证 Herdr child-env 通道时才允许为非空；否则配置解析必须返回 capability error。Pi 没有本项目可以假定的内置自主执行 flag；因此 v1 只有在 capability probe 确认了可用的非交互策略后才允许 unattended coordinator 启动，否则返回 `BLOCKED` 并保留已写入的 pipeline JSONL event log。
 
-代码应在每一次 `agent start` 或 exact-session continuation 前生成最终参数：
+代码应在每一次 `agent start` 或 exact-session continuation 前生成最终参数。模型解析顺序为 invocation-local `model`、stage/role `model`、`agents.<agent>.model`；省略 role/stage 模型时继承 agent profile：
 
 初次启动的 Pi `normalArgs` 不得包含 `--session`。Pi 的 exact resume 只在关闭 pane 后追加一次 `--session <saved-path>`；Codex 和 Claude 分别追加 `resume <id>` 与 `--resume <id>`。
 

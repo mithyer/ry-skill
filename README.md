@@ -82,8 +82,10 @@ and aggregation.
 
 The default role mapping is `scout -> codex`, `researcher -> claude`,
 `worker -> codex`, `reviewer -> claude`, `oracle -> pi`, and `delegate -> pi`.
-Invocation-local `agent`, `effort`, `extraArgs`, `cwd`, `timeoutMs`,
+Invocation-local `agent`, `model`, `effort`, `extraArgs`, `cwd`, `timeoutMs`,
 `panePolicy`, and explicit stage settings do not mutate global configuration.
+Agent selection and model resolution use `invocation > role > agent profile`
+precedence; role-level `model` overrides `agents.<agent>.model` for that role.
 Built-in Codex uses `--yolo`, Claude uses `--dangerously-skip-permissions`, and
 Pi uses its normal arguments.
 
@@ -125,6 +127,7 @@ extension never creates or overwrites either file.
   "action": "delegate",
   "task": "implement the requested change and run focused tests",
   "role": "worker",
+  "model": "model-name",
   "panePolicy": "new-tab"
 }
 ```

@@ -35,6 +35,7 @@ const pipelineStage = Type.Object({
 	role: Type.String({ minLength: 1 }),
 	task: Type.Optional(Type.String({ minLength: 1 })),
 	agent: Type.Optional(Type.Union([Type.Literal("codex"), Type.Literal("claude"), Type.Literal("pi")])),
+	model: Type.Optional(Type.String({ minLength: 1 })),
 	effort: Type.Optional(Type.String({ minLength: 1 })),
 	extraArgs: Type.Optional(Type.Array(Type.String())),
 	cwd: Type.Optional(Type.String({ minLength: 1 })),
@@ -51,6 +52,7 @@ export const DelegateToolParameters = Type.Object({
 	task: Type.Optional(Type.String({ minLength: 1 })),
 	role: Type.Optional(Type.String({ minLength: 1 })),
 	agent: Type.Optional(Type.Union([Type.Literal("codex"), Type.Literal("claude"), Type.Literal("pi")])),
+	model: Type.Optional(Type.String({ minLength: 1 })),
 	effort: Type.Optional(Type.String({ minLength: 1 })),
 	extraArgs: Type.Optional(Type.Array(Type.String())),
 	cwd: Type.Optional(Type.String({ minLength: 1 })),
@@ -988,7 +990,7 @@ async function executeDelegateToolWithConfig(
 			const submission = await coordinator.submit({
 				task: params.task,
 				panePolicy: params.panePolicy,
-				context: { role: params.role, agent: params.agent, effort: params.effort, extraArgs: params.extraArgs, cwd: params.cwd, timeoutMs: params.timeoutMs },
+				context: { role: params.role, agent: params.agent, model: params.model, effort: params.effort, extraArgs: params.extraArgs, cwd: params.cwd, timeoutMs: params.timeoutMs },
 				stages: params.stages,
 			}, ctx.cwd, workspaceId, sourcePaneId, params.cwd ?? ctx.cwd, signal, callerSession);
 			return toolResult({ status: submission.status, submission, communicationFile: submission.communicationFile });
@@ -1114,6 +1116,7 @@ async function executeDelegateToolWithConfig(
 		role: params.role ?? "delegate",
 		overrides: {
 			agent: params.agent,
+			model: params.model,
 			effort: params.effort,
 			extraArgs: params.extraArgs,
 			cwd: effectiveCwd,

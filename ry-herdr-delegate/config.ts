@@ -241,10 +241,12 @@ function parseAgentProfile(value: unknown, kind: AgentKind): AgentProfileConfig 
 /** Parses one role configuration and validates all invocation-facing fields. */
 function parseRole(value: unknown, path: string): RoleConfig {
 	const input = asRecord(value, path);
-	rejectUnknownKeys(input, ["agent", "effort", "extraArgs", "timeoutMs", "panePolicy", "env"], path);
+	rejectUnknownKeys(input, ["agent", "model", "effort", "extraArgs", "timeoutMs", "panePolicy", "env"], path);
+	const model = readOptionalString(input.model, `${path}.model`);
 	const effort = readOptionalString(input.effort, `${path}.effort`);
 	return {
 		agent: readAgentKind(input.agent, `${path}.agent`, "pi"),
+		model,
 		effort,
 		extraArgs: input.extraArgs === undefined ? undefined : readStringArray(input.extraArgs, `${path}.extraArgs`),
 		timeoutMs: input.timeoutMs === undefined ? undefined : readPositiveInteger(input.timeoutMs, `${path}.timeoutMs`, 1),
@@ -320,9 +322,9 @@ function resolveRole(config: DelegateConfig, role: string): RoleConfig {
 }
 
 /** Expands profile placeholders and rejects unresolved values before Herdr is called. */
-function expandArguments(values: readonly string[], profile: AgentProfileConfig, effort: string | undefined): string[] {
+function expandArguments(values: readonly string[], model: string | undefined, effort: string | undefined): string[] {
 	return values.map((value) => {
-		const expanded = value.replaceAll("{model}", profile.model ?? "").replaceAll("{effort}", effort ?? "");
+		const expanded = value.replaceAll("{model}", model ?? "").replaceAll("{effort}", effort ?? "");
 		if (expanded.includes("{")) throw configError("agentArgs", `unresolved placeholder in ${value}`);
 		return expanded;
 	});
@@ -343,6 +345,7 @@ export function resolveAgentProfile(
 	const roleConfig = resolveRole(config, role);
 	const kind = overrides.agent ?? roleConfig.agent;
 	const profile = config.agents[kind] ?? BUILT_IN_PROFILE_DEFAULTS[kind];
+	const model = overrides.model ?? roleConfig.model ?? profile.model ?? undefined;
 	const effort = overrides.effort ?? roleConfig.effort ?? profile.effort ?? undefined;
 	const profileEnv = mergeEnv(config.defaults.env, profile.env, roleConfig.env);
 	if (Object.keys(profileEnv).length > 0 && !capabilities.childEnvVerified) {
@@ -350,14 +353,14 @@ export function resolveAgentProfile(
 	}
 	return {
 		kind,
-		model: profile.model ?? undefined,
+		model,
 		effort,
-		modelArgs: profile.model ? expandArguments(profile.modelArgs ?? [], profile, effort) : [],
-		effortArgs: effort ? expandArguments(profile.effortArgs ?? [], profile, effort) : [],
+		modelArgs: model ? expandArguments(profile.modelArgs ?? [], model, effort) : [],
+		effortArgs: effort ? expandArguments(profile.effortArgs ?? [], model, effort) : [],
 		extraArgs: [
-			...expandArguments(profile.extraArgs ?? [], profile, effort),
-			...expandArguments(roleConfig.extraArgs ?? [], profile, effort),
-			...expandArguments(overrides.extraArgs ?? [], profile, effort),
+			...expandArguments(profile.extraArgs ?? [], model, effort),
+			...expandArguments(roleConfig.extraArgs ?? [], model, effort),
+			...expandArguments(overrides.extraArgs ?? [], model, effort),
 		],
 		autonomyEnabled: (profile.extraArgs ?? []).length > 0 || (roleConfig.extraArgs ?? []).length > 0 || (overrides.extraArgs ?? []).length > 0,
 		recoveryArgs: [...(profile.recoveryArgs ?? [])],
