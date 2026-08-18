@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -43,6 +43,20 @@ test("canonical cwd resource keys are absolute and stable", async () => {
 	try {
 		const key = await canonicalCwdResourceKey(root);
 		assert.equal(key, `cwd:${await realpath(root)}`);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Ensures resource ownership remains stable while a caller supplies a nonexistent cwd tail. */
+test("canonical cwd resource keys preserve nonexistent path tails", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-concurrency-missing-cwd-"));
+	try {
+		const existing = join(root, "existing");
+		await mkdir(existing);
+		const key = await canonicalCwdResourceKey(join(existing, "future", "child"));
+		assert.equal(key, `cwd:${await realpath(existing)}/future/child`);
+		assert.equal(await canonicalCwdResourceKey(""), undefined);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
@@ -125,6 +139,42 @@ test("workspace reservation ledger expires and reconciles orphaned leases", asyn
 		assert.equal((await ledger.active()).at(0)?.state, "orphan-pending");
 		await ledger.reconcile(new Set());
 		assert.equal((await ledger.active()).length, 0);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Ensures renewal is owner-fenced and keeps an otherwise expired lease active. */
+test("workspace reservation ledger heartbeats renew only the current owner lease", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-concurrency-heartbeat-"));
+	let now = new Date("2026-01-01T00:00:00.000Z");
+	try {
+		const ledger = new WorkspaceReservationLedger(root, "w-heartbeat", { now: () => now });
+		const initialExpiry = new Date(now.getTime() + 1_000).toISOString();
+		const renewedExpiry = new Date(now.getTime() + 10_000).toISOString();
+		const claim = {
+			reservationId: "reservation-heartbeat",
+			pipelineId: "pipeline-heartbeat",
+			stageId: "stage-heartbeat",
+			attempt: 1,
+			fencingToken: "fence-heartbeat",
+			reservedSlots: 1,
+			expiresAt: initialExpiry,
+			access: "workspace-write" as const,
+			resourceKeys: ["cwd:/tmp/heartbeat"],
+			ownerEpoch: "owner-heartbeat",
+		};
+		assert.equal((await ledger.claim(claim, { maxAgents: 1 })).committed, true);
+		assert.equal(await ledger.heartbeat(claim.reservationId, "stale-owner", renewedExpiry), false);
+		assert.equal(await ledger.heartbeat(claim.reservationId, claim.ownerEpoch, renewedExpiry), true);
+		now = new Date("2026-01-01T00:00:02.000Z");
+		const active = await ledger.active();
+		assert.equal(active.length, 1);
+		assert.equal(active[0]?.state, "active");
+		assert.equal(active[0]?.expiresAt, renewedExpiry);
+		assert.equal(active[0]?.lastHeartbeatAt, "2026-01-01T00:00:00.000Z");
+		assert.equal(await ledger.release(claim.reservationId, claim.ownerEpoch, "stale-fence"), false);
+		assert.equal(await ledger.release(claim.reservationId, claim.ownerEpoch, claim.fencingToken), true);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
