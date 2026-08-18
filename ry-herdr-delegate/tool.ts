@@ -184,20 +184,31 @@ export function selectAgentForTask(task: string): TaskDelegateAgent {
 	return "pi";
 }
 
-/** Global configuration path used by the extension and debug context. */
-const GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "agent", "ry-herdr-delegate.json");
+/** Primary user configuration path stored beside the managed ry-skill extension. */
+export const GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "agent", "extensions", "ry-skill", "ry-herdr-agent-config.json");
 
-/** Reads the optional global configuration without creating or mutating it. */
-async function loadGlobalConfig(): Promise<ReturnType<typeof parseDelegateConfig>> {
-	const path = GLOBAL_CONFIG_PATH;
-	try {
-		return parseDelegateConfig(JSON.parse(await readFile(path, "utf8")));
-	} catch (error) {
-		if (error && typeof error === "object" && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") {
-			return parseDelegateConfig({ version: 1 });
+/** Legacy configuration path retained for one-way compatibility with pre-0.6.2 installs. */
+export const LEGACY_GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "agent", "ry-herdr-delegate.json");
+
+/** Represents parsed configuration together with the file that supplied it. */
+interface LoadedGlobalConfig {
+	/** Parsed and validated runtime configuration. */
+	config: ReturnType<typeof parseDelegateConfig>;
+	/** Absolute path used to load the configuration. */
+	path: string;
+}
+
+/** Reads the extension-local configuration, then the legacy path without overwriting either file. */
+async function loadGlobalConfig(): Promise<LoadedGlobalConfig> {
+	for (const path of [GLOBAL_CONFIG_PATH, LEGACY_GLOBAL_CONFIG_PATH]) {
+		try {
+			return { config: parseDelegateConfig(JSON.parse(await readFile(path, "utf8"))), path };
+		} catch (error) {
+			if (error && typeof error === "object" && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw new Error(`Unable to load ry-herdr-delegate configuration: ${error instanceof Error ? error.message : String(error)}`);
 		}
-		throw new Error(`Unable to load ry-herdr-delegate configuration: ${error instanceof Error ? error.message : String(error)}`);
 	}
+	return { config: parseDelegateConfig({ version: 1 }), path: GLOBAL_CONFIG_PATH };
 }
 
 /** Formats structured tool details into a compact transcript-safe summary. */
@@ -680,7 +691,8 @@ export async function executeDelegateTool(
 	ctx: ExtensionContext,
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<DelegateToolDetails>> {
-	const config = await loadGlobalConfig();
+	const loadedConfig = await loadGlobalConfig();
+	const config = loadedConfig.config;
 	const workspaceId = process.env.HERDR_WORKSPACE_ID;
 	const paneId = process.env.HERDR_PANE_ID;
 	const piSession = currentPiSession(ctx);
@@ -691,7 +703,7 @@ export async function executeDelegateTool(
 		workspaceId,
 		paneId,
 		piSession,
-		configFile: GLOBAL_CONFIG_PATH,
+		configFile: loadedConfig.path,
 	});
 	return withDebugLogger(logger, async () => {
 		const directGateway = params.action === "delegate" ? new HerdrCliGateway({ cwd: ctx.cwd }) : undefined;

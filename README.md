@@ -112,10 +112,11 @@ runtime captures the first non-debugger V8 stack frame. Credential-like values,
 configured secret fields, and inline bearer/token forms are redacted before
 writing.
 
-Use [`ry-herdr-delegate/config.example.json`](ry-herdr-delegate/config.example.json)
-as the template for the optional global configuration at
-`~/.pi/agent/ry-herdr-delegate.json`. The extension never creates or overwrites
-that file.
+Use [`ry-herdr-delegate/config.example.json`](ry-herdr-delegate/config.example.json) as the template for the optional global configuration at
+`~/.pi/agent/extensions/ry-skill/ry-herdr-agent-config.json`. The runtime checks
+that extension-local path first and reads the legacy
+`~/.pi/agent/ry-herdr-delegate.json` only when the new file does not exist. The
+extension never creates or overwrites either file.
 
 #### Structured Tool Examples
 

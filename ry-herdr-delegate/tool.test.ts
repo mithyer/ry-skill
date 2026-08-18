@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import type {
@@ -16,12 +18,20 @@ import {
 	detectAutomaticDelegateRequest,
 	formatDelegateToolResult,
 	formatPipelineUi,
+	GLOBAL_CONFIG_PATH,
+	LEGACY_GLOBAL_CONFIG_PATH,
 	registerDelegateTool,
 	selectAgentForTask,
 	startDirectDelegateUiMonitor,
 	type DelegateToolDetails,
 	type DelegateToolParams,
 } from "./tool.ts";
+
+/** Verifies the extension-local configuration path and legacy migration boundary. */
+test("uses the extension-local ry-herdr-agent configuration path", () => {
+	assert.equal(GLOBAL_CONFIG_PATH, join(homedir(), ".pi", "agent", "extensions", "ry-skill", "ry-herdr-agent-config.json"));
+	assert.equal(LEGACY_GLOBAL_CONFIG_PATH, join(homedir(), ".pi", "agent", "ry-herdr-delegate.json"));
+});
 
 /** Builds the smallest UI surface needed by direct command and input-handler tests. */
 function makeContext(
