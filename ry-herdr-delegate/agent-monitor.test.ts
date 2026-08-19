@@ -161,6 +161,21 @@ test("AgentTurnMonitor maps definitive closure to BLOCKED", async () => {
 	assert.equal(gateway.readCalls, 0);
 });
 
+/** Verifies a settled provider failure is captured instead of being reduced to a generic parse timeout. */
+// TEST:result.test.ts[external provider error parsing captures actionable terminal evidence]
+test("AgentTurnMonitor captures a provider error from a settled pane", async () => {
+	const input = monitorInput({ relayTransport: "herdr-direct-v2", requireRelayAnchor: true });
+	const gateway = new MonitorFakeGateway([
+		`RELAY TRANSPORT: herdr-direct-v2\nMESSAGE ID: ${input.relayMessageId}\n■ unexpected status 503 Service Unavailable: group default has no available channels`,
+	], "idle");
+	const result = await new AgentTurnMonitor({ gateway, maxAttempts: 1, sleep: async () => undefined }).observe(input);
+
+	assert.equal(result.status, "ERROR");
+	assert.match(result.error ?? "", /503 Service Unavailable/);
+	assert.equal(result.completion?.status, "ERROR");
+	assert.match(result.completion?.summary ?? "", /503 Service Unavailable/);
+});
+
 /** Verifies missing contracts become bounded PARTIAL rather than semantic ERROR. */
 test("AgentTurnMonitor returns PARTIAL after the bounded observation budget", async () => {
 	const gateway = new MonitorFakeGateway(["old output", "still no contract"]);

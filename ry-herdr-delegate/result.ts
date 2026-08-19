@@ -77,3 +77,45 @@ export function errorCompletionContract(error: unknown): CompletionContract {
 		validation: "completion contract parsing failed",
 	};
 }
+
+/** Maximum terminal-error text retained in the durable result summary. */
+const MAX_EXTERNAL_ERROR_LENGTH = 800;
+
+/** Patterns that identify a settled provider or gateway failure without matching relay examples. */
+const EXTERNAL_FAILURE_PATTERNS: readonly RegExp[] = [
+	/\b(?:unexpected status|http status|status code)\s*[:=]?\s*[45]\d{2}\b/i,
+	/\b[45]\d{2}\s+(?:service unavailable|bad gateway|gateway timeout|too many requests)\b/i,
+	/\b(?:service unavailable|bad gateway|gateway timeout|no available channels|no available providers)\b/i,
+	/无可用渠道/u,
+];
+
+/** Redacts credential-shaped fragments before terminal failures enter the result event. */
+function redactExternalErrorLine(line: string): string {
+	return line
+		.replace(/^\s*[■⏺•●▪◦]+\s*/u, "")
+		.replace(/\s+/g, " ")
+		.replace(/((?:bearer\s+|token\s*[:=]\s*|secret\s*[:=]\s*|password\s*[:=]\s*|authorization\s*[:=]\s*|api[_-]?key\s*[:=]\s*)\s*)[^\s,;]+/gi, "$1<REDACTED>")
+		.replace(/([?&](?:token|secret|password|authorization|api[_-]?key)=)[^&\s]+/gi, "$1<REDACTED>")
+		.trim()
+		.slice(0, MAX_EXTERNAL_ERROR_LENGTH);
+}
+
+/** Extracts one actionable provider failure from settled terminal output.
+ *
+ * @param text Terminal output captured from the exact external agent session.
+ * @returns An ERROR completion contract with bounded redacted evidence, or undefined when no provider failure is recognized.
+ * TEST:result.test.ts[external provider error parsing captures actionable terminal evidence]
+ */
+export function parseExternalErrorContract(text: string): CompletionContract | undefined {
+	for (const line of text.split(/\r?\n/)) {
+		if (!EXTERNAL_FAILURE_PATTERNS.some((pattern) => pattern.test(line))) continue;
+		const summary = redactExternalErrorLine(line);
+		if (!summary) continue;
+		return {
+			status: "ERROR",
+			summary: `External agent error: ${summary}`,
+			validation: "external agent reported an error before completion contract",
+		};
+	}
+	return undefined;
+}

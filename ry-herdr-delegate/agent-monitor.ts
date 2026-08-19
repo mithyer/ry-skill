@@ -1,6 +1,6 @@
 import { hashDebugText } from "./debug.ts";
 import { currentRelayOutput, DIRECT_RELAY_READ_MARGIN_LINES, hasRelayAnchor } from "./relay.ts";
-import { errorCompletionContract, parseCompletionContract } from "./result.ts";
+import { errorCompletionContract, parseCompletionContract, parseExternalErrorContract } from "./result.ts";
 import type {
 	AgentTransportStatus,
 	CompletionContract,
@@ -334,6 +334,12 @@ export class AgentTurnMonitor {
 				} catch (error) {
 					lastError = error;
 				}
+			}
+			// A settled pane can expose a provider failure without ever emitting the child contract.
+			// Capture that terminal evidence before the generic missing-contract PARTIAL path hides it.
+			if (!completion && relayOutput && snapshot.status !== "working" && snapshot.status !== "unknown") {
+				const externalError = parseExternalErrorContract(relayOutput);
+				if (externalError) return this.resultFromCompletion(input, resultKey, snapshot, observations, externalError, "terminal");
 			}
 			if (!completion && this.dependencies.captureFallback) {
 				const fallback = await this.dependencies.captureFallback(input);

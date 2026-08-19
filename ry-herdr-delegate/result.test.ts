@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { closedPaneTabLabel, planPaneDisposition, resolvePanePolicy } from "./pane-policy.ts";
-import { errorCompletionContract, isSemanticDone, parseCompletionContract } from "./result.ts";
+import { errorCompletionContract, isSemanticDone, parseCompletionContract, parseExternalErrorContract } from "./result.ts";
 
 /** Checks completion parsing requires status, summary, and validation evidence. */
 test("completion contract parsing distinguishes DONE from incomplete output", () => {
@@ -40,6 +40,18 @@ test("completion contract parsing distinguishes DONE from incomplete output", ()
 	assert.throws(() => parseCompletionContract("abcSTATUS: DONE\nSUMMARY: too many prefix characters\nVALIDATION: no files changed\n"), /STATUS/);
 	assert.equal(errorCompletionContract(new Error("bad")).status, "ERROR");
 	assert.throws(() => parseCompletionContract("STATUS: DONE\nSUMMARY: missing validation"), /VALIDATION/);
+});
+
+/** Verifies provider failures are surfaced without treating them as missing completion contracts. */
+// TEST:agent-monitor.test.ts[AgentTurnMonitor captures a provider error from a settled pane]
+test("external provider error parsing captures actionable terminal evidence", () => {
+	const completion = parseExternalErrorContract("■ unexpected status 503 Service Unavailable: group default has no available channels");
+	assert.equal(completion?.status, "ERROR");
+	assert.match(completion?.summary ?? "", /503 Service Unavailable/);
+	assert.match(completion?.validation ?? "", /external agent reported an error/);
+	const redacted = parseExternalErrorContract("unexpected status 503 Service Unavailable: https://example.test/?token=do-not-persist");
+	assert.doesNotMatch(redacted?.summary ?? "", /do-not-persist/);
+	assert.equal(parseExternalErrorContract("STATUS: DONE\\nSUMMARY: complete\\nVALIDATION: passed"), undefined);
 });
 
 /** Checks pane disposition cannot run before semantic DONE and uses stable labels. */
