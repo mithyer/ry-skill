@@ -8,6 +8,15 @@ import { resolveAgentProfile, type ConfigCapabilities } from "./config.ts";
 import { debug, debugError, hashDebugText } from "./debug.ts";
 import { planPaneDisposition } from "./pane-policy.ts";
 import { appendEvent, communicationIdFromPath, createEventLog, createEventLogEvent, readEventLog } from "./records.ts";
+import {
+	buildDirectRelayPrompt,
+	buildLegacyRelayEnvelope,
+	DIRECT_RELAY_TRANSPORT,
+	hasRelayAnchor,
+	relayTransportFromPayload,
+	RelayPromptValidationError,
+	type BuiltDirectRelayPrompt,
+} from "./relay.ts";
 import { isSemanticDone, parseCompletionContract } from "./result.ts";
 import type {
 	CompletionContract,
@@ -21,6 +30,7 @@ import type {
 	JsonlEvent,
 	NewJsonlEvent,
 	PanePolicy,
+	RelayTransport,
 	SemanticStatus,
 	SessionIdentity,
 } from "./types.ts";
@@ -76,6 +86,10 @@ interface LeafRuntime {
 	baseline?: AgentTurnBaseline;
 	/** Timestamp when the logical relay submission began. */
 	submittedAt?: string;
+	/** Persisted transport used by the current relay and recovery parser. */
+	relayTransport: RelayTransport;
+	/** Prompt line count used to size direct terminal reads. */
+	relayPromptLines?: number;
 	/** Continuations require an explicit current relay marker in terminal output. */
 	requireRelayAnchor?: boolean;
 	/** Resource metadata copied into each stage checkpoint. */
@@ -126,6 +140,7 @@ function event(
 		...(agentSession ? { agentSession } : {}),
 		payload: {
 			...payload,
+			relayTransport: runtime.relayTransport,
 			...(runtime.attempt !== undefined ? { attempt: runtime.attempt } : {}),
 			...(runtime.fencingToken ? { fencingToken: runtime.fencingToken } : {}),
 			...(runtime.executionFence ? { executionFence: runtime.executionFence } : {}),
@@ -138,24 +153,9 @@ function event(
 	};
 }
 
-/** Builds the fixed relay envelope with no task-specific text outside the event log. */
+/** Builds the legacy pointer envelope retained for old in-flight relays and compatibility tests. */
 export function buildRelayEnvelope(file: string, lineStart: number, lineEnd: number, lineCount: number, messageId: string, messageType: "task" | "continuation" = "task"): string {
-	return [
-		`COMMUNICATION FILE: ${file}`,
-		`MESSAGE SEQ: ${lineStart}`,
-		`MESSAGE LINES: ${lineStart}-${lineEnd}`,
-		`MESSAGE LINE COUNT: ${lineCount}`,
-		`MESSAGE ID: ${messageId}`,
-		`MESSAGE TYPE: ${messageType}`,
-		"",
-		"Read and parse this JSONL event before acting.",
-		"Return exactly these three headings, each on its own line:",
-		"STATUS: DONE|BLOCKED|PARTIAL|ERROR",
-		"SUMMARY: <one-line result>",
-		"VALIDATION: <commands or checks performed>",
-		"Use STATUS: DONE only when the task is complete and validated.",
-		"Do not delegate recursively.",
-	].join("\n");
+	return buildLegacyRelayEnvelope(file, lineStart, lineEnd, lineCount, messageId, messageType);
 }
 
 /** Generates a durable communication filename from the task role and a short id. */
@@ -220,18 +220,17 @@ function parsePiSessionMessages(text: string): readonly PiSessionMessage[] {
 	return messages;
 }
 
-/** Matches the parent-generated relay markers so an older Pi turn cannot supply this completion. */
-function isMatchingPiRelay(text: string, communicationFile: string, messageId: string): boolean {
-	const lines = new Set(text.split(/\r?\n/).map((line) => line.trim()));
-	return lines.has(`COMMUNICATION FILE: ${communicationFile}`) && lines.has(`MESSAGE ID: ${messageId}`);
+/** Matches the parent-generated versioned relay markers so an older Pi turn cannot supply this completion. */
+function isMatchingPiRelay(text: string, communicationFile: string, messageId: string, relayTransport: import("./types.ts").RelayTransport = "pointer-v1"): boolean {
+	return hasRelayAnchor(text, { transport: relayTransport, communicationFile, relayMessageId: messageId });
 }
 
 /** Finds a strict completion response associated with one exact relay in a Pi session. */
-function parsePiRelayCompletion(text: string, communicationFile: string, messageId: string): CompletionContract | undefined {
+function parsePiRelayCompletion(text: string, communicationFile: string, messageId: string, relayTransport: import("./types.ts").RelayTransport = "pointer-v1"): CompletionContract | undefined {
 	const messages = parsePiSessionMessages(text);
 	let relayIndex = -1;
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		if (messages[index].role === "user" && isMatchingPiRelay(messages[index].text, communicationFile, messageId)) {
+		if (messages[index].role === "user" && isMatchingPiRelay(messages[index].text, communicationFile, messageId, relayTransport)) {
 			relayIndex = index;
 			break;
 		}
@@ -343,6 +342,7 @@ export class DelegateEngine {
 			attempt: request.attempt ?? 1,
 			fencingToken: request.fencingToken,
 			executionFence: request.executionFence ?? request.fencingToken ?? `${owner}:${transaction}`,
+			relayTransport: DIRECT_RELAY_TRANSPORT,
 			requireRelayAnchor: Boolean(request.previousCommunication),
 			resourceKeys: context.resourceKeys ?? request.resourceKeys,
 			access: context.access ?? request.access,
@@ -393,11 +393,37 @@ export class DelegateEngine {
 			await debug.log("leaf.record.ready", { communicationId: runtime.communicationId, communicationFile, existing }, "debug");
 			const messageId = existing ? `continuation-${runtime.communicationId}-${id()}` : `msg-${id()}`;
 			const messageType = existing ? "continuation" : "task";
+			// Resolve the exact startup argv once so the event audit and direct prompt cannot diverge.
+			const finalAgentArgs = buildFinalAgentArgs(profile, request.previousSession);
+			// Keep one structured payload for redaction, prompt serialization, and durable handoff audit.
+			const directPromptPayload: Record<string, unknown> = {
+				relayTransport: DIRECT_RELAY_TRANSPORT,
+				transaction,
+				stageId: runtime.stageId ?? role,
+				stageRole: role,
+				stageOccurrence,
+				attempt: runtime.attempt,
+				fencingToken: runtime.fencingToken,
+				executionFence: runtime.executionFence,
+				task: request.task,
+				role,
+				agent: profile.kind,
+				model: profile.model,
+				effort: profile.effort,
+				agentArgs: finalAgentArgs,
+				autonomyEnabled: profile.autonomyEnabled,
+				panePolicy: runtime.panePolicy,
+				cwd: runtime.cwd,
+				resourceKeys: runtime.resourceKeys,
+				access: runtime.access,
+				continuation: request.continuation,
+			};
+			const builtRelay: BuiltDirectRelayPrompt = buildDirectRelayPrompt({ messageId, messageType, payload: directPromptPayload });
 			const handoff = await appendEvent(communicationFile, event(messageType, owner, runtime, {
 				task: request.task,
 				role,
 				agent: profile.kind,
-				agentArgs: buildFinalAgentArgs(profile, request.previousSession),
+				agentArgs: finalAgentArgs,
 				autonomyEnabled: profile.autonomyEnabled,
 				panePolicy: runtime.panePolicy,
 				transaction,
@@ -407,10 +433,13 @@ export class DelegateEngine {
 				previousCommunication: request.previousCommunication,
 				previousSession: request.previousSession,
 				continuation: request.continuation,
-				cwd: overrides.cwd ?? context.cwd,
+				cwd: runtime.cwd,
+				relayTransport: DIRECT_RELAY_TRANSPORT,
+				directPromptPayload: builtRelay.payload,
 			}, messageId),
-		);
-			const relay = buildRelayEnvelope(communicationFile, handoff.lineStart, handoff.lineEnd, handoff.lineCount, messageId, messageType);
+			);
+			runtime.relayPromptLines = builtRelay.lineCount;
+			const relay = builtRelay.text;
 			await debug.log("leaf.handoff.appended", {
 				communicationId: runtime.communicationId,
 				messageId,
@@ -435,7 +464,7 @@ export class DelegateEngine {
 				return await this.waitAndResolve(runtime, profile.timeoutMs, owner, messageId, operationSignal);
 			}
 			await debug.log("leaf.pane.split.start", { communicationId: runtime.communicationId, sourcePaneId: context.sourcePaneId, cwd: runtime.cwd }, "debug");
-			const finalArgs = buildFinalAgentArgs(profile, request.previousSession);
+			const finalArgs = finalAgentArgs;
 			const splitPane = (): Promise<HerdrPane> => this.dependencies.gateway.splitPane({
 				sourcePaneId: context.sourcePaneId,
 				direction: "right",
@@ -528,7 +557,7 @@ export class DelegateEngine {
 				}, undefined, runtime.session)).catch(() => undefined);
 			}
 			await appendEvent(communicationFile, event("error", owner, runtime, { error: error instanceof Error ? error.message : String(error) })).catch(() => undefined);
-			const blocked = error instanceof BaselineCaptureError;
+			const blocked = error instanceof BaselineCaptureError || error instanceof RelayPromptValidationError;
 			const deadlineExpired = runtime.deadlineAt !== undefined && Date.now() >= runtime.deadlineAt;
 			const unfinishedOperation = operationSignal.aborted || deadlineExpired || commandTimedOut;
 			const status: SemanticStatus = blocked ? "BLOCKED" : unfinishedOperation ? "PARTIAL" : "ERROR";
@@ -572,6 +601,28 @@ export class DelegateEngine {
 				paneId: previous.paneId,
 			}, "warn");
 			return undefined;
+		}
+		let relayTransport: RelayTransport;
+		try {
+			relayTransport = relayTransportFromPayload(handoff.event.payload);
+		} catch (error) {
+			await debug.log("leaf.reconcile.transport-invalid", { communicationId: previous.communicationId, error: debugError(error) }, "warn");
+			return undefined;
+		}
+		let relayPromptLines: number | undefined;
+		if (relayTransport === DIRECT_RELAY_TRANSPORT) {
+			const persistedDirectPayload = asRecord(handoff.event.payload.directPromptPayload);
+			if (!persistedDirectPayload) return undefined;
+			try {
+				relayPromptLines = buildDirectRelayPrompt({
+					messageId: handoff.event.messageId!,
+					messageType: handoff.event.type,
+					payload: persistedDirectPayload,
+				}).lineCount;
+			} catch (error) {
+				await debug.log("leaf.reconcile.prompt-invalid", { communicationId: previous.communicationId, error: debugError(error) }, "warn");
+				return undefined;
+			}
 		}
 		const persistedCwd = handoff.event.payload.cwd;
 		const persistedPanePolicy = handoff.event.payload.panePolicy;
@@ -627,6 +678,8 @@ export class DelegateEngine {
 			attempt: typeof handoff.event.payload.attempt === "number" ? handoff.event.payload.attempt : 1,
 			fencingToken: typeof handoff.event.payload.fencingToken === "string" ? handoff.event.payload.fencingToken : undefined,
 			executionFence: typeof handoff.event.payload.executionFence === "string" ? handoff.event.payload.executionFence : handoff.event.transaction,
+			relayTransport,
+			relayPromptLines,
 			layoutLock: context.layoutLock,
 			session: observed.agentSession,
 		};
@@ -676,6 +729,8 @@ export class DelegateEngine {
 			expectedSession: runtime.session!,
 			communicationFile: runtime.communicationFile,
 			relayMessageId: handoff.event.messageId,
+			relayTransport: runtime.relayTransport,
+			relayPromptLines: runtime.relayPromptLines,
 			baseline,
 			deadlineAt: new Date(Date.now() + 5_000).toISOString(),
 			submittedAt: handoff.event.timestamp,
@@ -701,6 +756,7 @@ export class DelegateEngine {
 					outputLength: observation.outputLength,
 					postSubmit: observation.postSubmit,
 					relayAnchor: observation.relayAnchor,
+					relayTransport: observation.relayTransport,
 				}, undefined, observation.agentSession));
 			},
 		});
@@ -866,7 +922,7 @@ export class DelegateEngine {
 		if (!isReadablePiSession(runtime.session)) return undefined;
 		try {
 			const output = await readFile(runtime.session.value, "utf8");
-			const completion = parsePiRelayCompletion(output, runtime.communicationFile, relayMessageId);
+			const completion = parsePiRelayCompletion(output, runtime.communicationFile, relayMessageId, runtime.relayTransport);
 			if (!completion) return undefined;
 			await debug.log("leaf.output.session-contract-found", {
 				communicationId: runtime.communicationId,
@@ -997,6 +1053,8 @@ export class DelegateEngine {
 			expectedSession: runtime.session,
 			communicationFile: runtime.communicationFile,
 			relayMessageId,
+			relayTransport: runtime.relayTransport,
+			relayPromptLines: runtime.relayPromptLines,
 			baseline: runtime.baseline,
 			deadlineAt: new Date(runtime.deadlineAt ?? Date.now() + timeoutMs).toISOString(),
 			submittedAt: runtime.submittedAt ?? new Date().toISOString(),
@@ -1020,6 +1078,7 @@ export class DelegateEngine {
 					outputLength: observation.outputLength,
 					postSubmit: observation.postSubmit,
 					relayAnchor: observation.relayAnchor,
+					relayTransport: observation.relayTransport,
 				}, undefined, observation.agentSession));
 			},
 		});

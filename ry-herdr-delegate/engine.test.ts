@@ -4,6 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { buildRelayEnvelope, DelegateEngine } from "./engine.ts";
+import { DIRECT_RELAY_TRANSPORT, MAX_DIRECT_RELAY_BYTES } from "./relay.ts";
 import { HerdrCommandError } from "./herdr/client.ts";
 import { parseDelegateConfig } from "./config.ts";
 import { readEventLog } from "./records.ts";
@@ -145,6 +146,8 @@ test("DelegateEngine completes a leaf only after exact checkpoint and DONE contr
 		assert.equal(result.status, "DONE");
 		assert.equal(gateway.lastPrompt?.wait, false);
 		assert.ok((gateway.lastPrompt?.timeoutMs ?? 0) >= 300000);
+		assert.match(gateway.lastPrompt?.text ?? "", new RegExp(`^RELAY TRANSPORT: ${DIRECT_RELAY_TRANSPORT}\\nMESSAGE ID:`));
+		assert.doesNotMatch(gateway.lastPrompt?.text ?? "", /COMMUNICATION FILE:|MESSAGE SEQ:|MESSAGE LINES:/);
 		assert.deepEqual(gateway.calls, ["split", "start", "get", "read", "prompt", "wait", "read", "move"]);
 		assert.equal(gateway.lastMove?.paneId, "w-test:p2");
 		assert.equal(gateway.lastMove?.newTab, true);
@@ -160,6 +163,29 @@ test("DelegateEngine completes a leaf only after exact checkpoint and DONE contr
 	}
 });
 
+
+/** Verifies direct prompt validation blocks before creating a child pane or appending a task handoff. */
+test("DelegateEngine blocks an oversized direct prompt before pane creation", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-prompt-too-large-"));
+	try {
+		const gateway = new FakeGateway("STATUS: DONE\nSUMMARY: should not run\nVALIDATION: should not run");
+		const engine = await createEngine(gateway, root);
+		const result = await engine.run({ action: "delegate", task: "x".repeat(MAX_DIRECT_RELAY_BYTES), role: "worker" }, {
+			cwd: "/tmp/project",
+			workspaceId: "w-test",
+			sourcePaneId: "w-test:p1",
+		});
+		assert.equal(result.status, "BLOCKED");
+		assert.match(result.error ?? "", /exceeds/);
+		assert.deepEqual(gateway.calls, []);
+		const events = (await readEventLog(result.communicationFile)).events.map(({ event }) => event);
+		assert.equal(events.some((event) => event.type === "task"), false);
+		assert.equal(events.at(-1)?.type, "error");
+		assert.equal(events.at(-1)?.eventId.startsWith("error-"), true);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
 
 /** Verifies an unknown relay submission continues through the same exact-session monitor. */
 test("DelegateEngine observes a child after an ambiguous Herdr relay failure", async () => {
@@ -223,7 +249,8 @@ test("DelegateEngine reconciles a late exact Pi completion without resending", a
 		assert.equal(partial.status, "PARTIAL");
 		const handoff = (await readEventLog(partial.communicationFile)).events.find(({ event }) => event.type === "task");
 		assert.ok(handoff?.event.messageId);
-		const relay = buildRelayEnvelope(partial.communicationFile, handoff.line, handoff.line, 1, handoff.event.messageId);
+		const relay = gateway.lastPrompt?.text;
+		assert.ok(relay);
 		await writeFile(sessionFile, [
 			piSessionMessage("user", relay),
 			piSessionMessage("assistant", "STATUS: DONE\nSUMMARY: completed after the parent wait ended\nVALIDATION: build passed"),
@@ -413,10 +440,10 @@ test("DelegateEngine falls back to the exact Pi session when Herdr terminal rows
 	const root = await mkdtemp(join("/tmp", "ry-herdr-engine-session-fallback-"));
 	try {
 		const sessionFile = join(root, "child.jsonl");
-		const communicationFile = join(root, "communications", "worker-session-fallback.jsonl");
 		const currentRelay = [
-			`COMMUNICATION FILE: ${communicationFile}`,
+			"RELAY TRANSPORT: herdr-direct-v2",
 			"MESSAGE ID: msg-session-fallback",
+			"MESSAGE TYPE: task",
 		].join("\n");
 		await writeFile(sessionFile, [
 			piSessionMessage("user", "COMMUNICATION FILE: /tmp/old.jsonl\nMESSAGE ID: msg-old"),

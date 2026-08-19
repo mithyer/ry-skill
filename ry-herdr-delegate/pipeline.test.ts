@@ -3,6 +3,8 @@ import { access, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
+import { DIRECT_RELAY_TRANSPORT } from "./relay.ts";
+import { readEventLog } from "./records.ts";
 import { PipelineStore, type PipelineRequestInput } from "./pipeline.ts";
 
 /** Rejects malformed stage input before it can create a durable pipeline event log. */
@@ -51,6 +53,10 @@ test("PipelineStore round-trips a normalized default stage and inbox pointer", a
 		}, "pipeline-roundtrip", "transaction-roundtrip", 8);
 		const request = await store.readRequest("pipeline-roundtrip", 8);
 		const inbox = await store.readInbox();
+		const snapshot = await readEventLog(created.request.communicationFile);
+		assert.equal(snapshot.events.find(({ event }) => event.type === "task")?.event.payload.relayTransport, DIRECT_RELAY_TRANSPORT);
+		await store.validateRelayMessage("pipeline-roundtrip", created.request.messageId, DIRECT_RELAY_TRANSPORT);
+		await assert.rejects(store.validateRelayMessage("pipeline-roundtrip", "missing-relay", DIRECT_RELAY_TRANSPORT), /no durable relay message/);
 		assert.equal(request.task, "review the requested change");
 		assert.equal(request.panePolicy, "keep");
 		assert.deepEqual(request.stages, [{

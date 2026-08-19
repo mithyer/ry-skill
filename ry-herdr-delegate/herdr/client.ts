@@ -621,11 +621,15 @@ export class HerdrCliGateway implements HerdrGateway {
 	/**
 	 * Reads recent terminal output from an agent.
 	 *
-	 * @param target Herdr agent name or target.
+	 * @param target Agent target whose terminal should be read.
+	 * @param signal Optional cancellation signal for the Herdr process.
+	 * @param lines Maximum recent terminal lines to request; defaults to the legacy 500-line window.
 	 * @returns Raw terminal output text.
+	 * TEST:herdr.test.ts[HerdrCliGateway uses the validated spawn boundary]
 	 */
-	async readAgent(target: string, signal?: AbortSignal): Promise<HerdrAgentOutput> {
-		const args = ["agent", "read", target, "--source", "recent-unwrapped", "--lines", "500", "--format", "text"];
+	async readAgent(target: string, signal?: AbortSignal, lines = 500): Promise<HerdrAgentOutput> {
+		const safeLines = Number.isSafeInteger(lines) && lines > 0 ? lines : 500;
+		const args = ["agent", "read", target, "--source", "recent-unwrapped", "--lines", String(safeLines), "--format", "text"];
 		let result: { stdout: string; stderr: string } | undefined;
 		for (let attempt = 1; attempt <= AGENT_READ_ATTEMPTS; attempt += 1) {
 			try {

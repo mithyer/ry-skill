@@ -37,6 +37,7 @@
     "ry-herdr-delegate/pane-policy.ts",
     "ry-herdr-delegate/engine.ts",
     "ry-herdr-delegate/agent-monitor.ts",
+    "ry-herdr-delegate/relay.ts",
     "ry-herdr-delegate/pipeline.ts",
     "ry-herdr-delegate/pipeline-coordinator.ts",
     "ry-herdr-delegate/coordinator-store.ts",

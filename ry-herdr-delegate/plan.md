@@ -78,7 +78,7 @@
 - `ry-herdr-delegate/config.ts`
 - `ry-herdr-delegate/args.ts`
 - `ry-herdr-delegate/records.ts`
-- `ry-herdr-delegate/record-reader.ts`（只读 JSONL event/message 校验；必要时供共享 `ry-herdr-record read` 命令使用）
+- `ry-herdr-delegate/records.ts`（包含 parent/coordinator-only 的 JSONL event/message 读取、校验和 replay；不新增独立 child reader）
 - `ry-herdr-delegate/result.ts`
 - `ry-herdr-delegate/recovery.ts`（JSONL replay、session recovery 的纯逻辑）
 - `ry-herdr-delegate/pane-policy.ts`（disposition 决策的纯逻辑）
@@ -93,7 +93,7 @@
 - 实现 JSONL event schema、append/replay、`seq`/`eventId`/`messageId`/物理行号校验、敏感值清理、幂等重试和 event-log identity。任务正文必须保持单行 JSON 编码；非法 JSON、跳号、冲突 id 和不完整尾行都必须 fail closed。
 - 使用 `proper-lockfile` 的 filesystem sidecar lock：event log 使用 `<communicationId>.jsonl.lock`，coordinator binding 使用 `pipeline-coordinator.json.lock`；锁的 stale/retry 策略、释放和异常恢复必须有跨进程测试。
 - v1 选择 parent/coordinator 作为唯一 result writer；child 输出由 gateway 捕获后写入 `child-output-capture`/`result` event，避免多个进程无序修改同一文件。
-- `record-reader.ts` 只提供共享的只读路径归属、schema、消息范围和敏感值校验；Codex/Claude 不获得专用插件或 event-log 写权限。若 live smoke 证明普通文件读取足够，则不额外注册 `ry-herdr-record read` 命令。
+- `records.ts` 只提供 parent/coordinator 使用的路径归属、schema、消息范围、敏感值校验和 replay；Codex/Claude 不获得专用插件或 event-log 写权限。若 live smoke 证明普通文件读取足够，不注册 `ry-herdr-record read` 命令，也不新增 `record-reader.ts`。
 - 增加 `tsconfig.json`、`npm run typecheck` 和必要的 `typescript`/`@types/node` devDependencies；类型检查必须覆盖新增 extension 源码和现有共享模块。
 
 **完成条件**
@@ -138,7 +138,7 @@
 
 - `ry-herdr-delegate/coordinator-store.ts`
 - `ry-herdr-delegate/pipeline-coordinator.ts`
-- `ry-herdr-delegate/coordinator-prompt.ts`
+- `ry-herdr-delegate/pipeline-coordinator.ts`（包含 coordinator prompt builder 和调度逻辑）
 - `ry-herdr-delegate/pipeline.ts`
 
 **实现内容**
@@ -258,3 +258,172 @@ live smoke 的前置条件必须显式满足：Pi 0.83+、Herdr 0.8+ server 正�
 - package、README、配置示例、旧 Skill 回滚材料和 design/plan 文档一致；
 - `git diff --check`、`npm run typecheck`、测试和 npm pack 均通过；
 - 未验证的 Herdr、Pi 或跨进程行为已明确记录为风险，而不是标记为 DONE。
+
+## 9. Communication Payload 解耦专项计划
+
+> 状态：实施中。direct-v2 prompt、双 anchor、leaf/coordinator relay 和基础测试已落地；live smoke、完整兼容回滚演练和发布门禁仍未完成。本专项不删除 JSONL event log，只把 JSONL 从 Leaf Child 的输入通道改为 parent/coordinator 的持久化状态日志。
+>
+> 本节覆盖前文对 pointer relay、child event-log 读取和旧模块拆分的预研描述；前文保留为当前实现 baseline，后续实现以本节 direct-v2 contract、兼容边界和验收门槛为准。
+
+### 9.1 目标与边界
+
+本专项采用以下职责划分：
+
+| 层 | 目标职责 |
+| --- | --- |
+| Herdr prompt | 直接传递本次 task/continuation 的完整、已校验任务载荷 |
+| Pipeline/stage JSONL | 保存 intent、队列、checkpoint、observation、result、error、recovery 和幂等身份 |
+| Parent/coordinator | 读取、追加、重放 JSONL，并负责结果校验和状态推进 |
+| Leaf Child | 只读取 Herdr prompt，执行工作并返回 completion contract；不读取或写入 communication JSONL |
+
+本专项不改变以下语义：
+
+- `pipeline.status`、`recover` 和 coordinator recovery 仍以 JSONL replay 为权威；
+- `messageId`、`eventId`、`resultKey`、attempt、fencing token 和 exact `agent_session` 仍必须持久化；
+- child 输出仍由 Parent 或 Coordinator 捕获后写入 `observation`/`result`/`error` event；
+- child 不获得通信文件插件、写权限或状态 owner 身份；
+- 旧 Markdown record 仍不读取、不导入、不转换。
+
+`communicationFile` 在第一版解耦中保留为 event-log 路径和诊断 metadata。`relayTransport` 明确区分 transport 版本：缺少该字段的既有 event 一律按 `pointer-v1` replay 和匹配，`herdr-direct-v2` 只表示新的 direct prompt。文档和新代码注释应逐步使用“event log”表达其状态职责，不再把它描述为 Leaf Child 的必需通信通道；兼容期结束后仍可保留字段名，但不得再用它作为 direct child 的输入依赖。
+
+### 9.2 目标数据流
+
+#### Direct delegate
+
+```text
+Parent
+  W stage event log: event-log-created / task
+  -> Herdr: 完整 direct task prompt
+
+Leaf Child
+  R Herdr prompt
+  W 工作区、自己的 session 和终端输出
+  -> completion contract
+
+Parent
+  R child pane/session 输出
+  W stage event log: observation / result / error / pane-disposition
+```
+
+#### Pipeline
+
+```text
+Main Parent
+  W pipeline event log: task
+  W durable inbox: queue pointer
+  -> Herdr: 完整 pipeline request 或完整 control payload
+
+Coordinator
+  R Herdr direct payload + durable inbox/event log 做 identity 对照
+  W pipeline event log: accepted / stage status / final result
+  W stage event log: task / checkpoint / result
+  -> Herdr: 完整 stage task/continuation prompt
+
+Leaf Child
+  R Herdr stage prompt
+  W 工作区、自己的 session 和终端输出
+
+Coordinator
+  R child pane/session 输出
+  W stage event log 和 pipeline event log
+```
+
+Parent 到 Coordinator 的 inbox、answer、stop、recover 都使用 direct-v2 payload；durable inbox 仍然保留，用于排队、重启恢复和去重。Coordinator 到 stage child 的任务和 continuation 复用 direct leaf 的同一 prompt builder，不再存在第二套 pointer envelope。Coordinator 仍必须以 durable JSONL 的 `pipelineId`、`messageId`、attempt 和 fence 校验 prompt，不能只相信 Herdr 传输文本。
+
+Herdr 负责传输，JSONL 负责持久化；任何一方都不能单独替代另一方：Herdr 不提供 pipeline durable queue/replay，JSONL 也不再作为 child 的输入依赖。
+
+### 9.3 Event 与 Prompt Contract
+
+1. 在创建 handoff event 前，构造经过 schema、identity、敏感值和 transport 校验的 normalized relay payload；同一份完成校验且已脱敏的载荷同时用于 event audit 和 Herdr prompt，禁止先对 prompt 单独拼接再写另一份 event。
+2. 新 task/continuation/control event 在 payload 中记录 `relayTransport: "herdr-direct-v2"`；缺少该字段的旧 event 固定解释为 `pointer-v1`，不能因为缺少字段而切换到 direct 解析，也不能因新增字段而破坏 replay。
+3. direct-v2 prompt 以固定、非 `-` 开头的 identity block 开始，至少包含以下精确字段：
+   ```text
+   RELAY TRANSPORT: herdr-direct-v2
+   MESSAGE ID: <message-id>
+   MESSAGE TYPE: task|continuation|control
+   ```
+   monitor 的 direct anchor 是 `(relayTransport, messageId)`；legacy pointer-v1 anchor 仍是 `(communicationFile, messageId)`。两种 anchor 必须按 persisted `relayTransport` 选择，不能接受任意一个看起来相似的 marker。
+4. direct prompt 至少包含 transaction、stage id/role/occurrence、attempt、fencing token、execution fence（适用时）、task 或 continuation、cwd、资源/访问约束、agent profile 的必要执行约束、固定的 `STATUS`/`SUMMARY`/`VALIDATION` completion contract，以及禁止递归 delegate 的约束。结构化字段使用确定性的序列化规则；task 正文与 metadata 分隔，避免正文中的 marker 被当成当前 relay anchor。
+5. direct prompt 不要求 child 打开 `communicationFile`，也不发送 `MESSAGE SEQ`、`MESSAGE LINES`、event-log 解析规则或 parent-owned recovery 责任。`communicationFile` 只作为 parent/coordinator 的路径、审计和旧 relay 兼容 metadata。
+6. prompt 发送前执行 UTF-8 byte length 和行数限制。首个版本固定 `64 KiB` 和 `400` 行上限；超限在创建 pane、append handoff relay event 和 Herdr send 之前返回结构化 `BLOCKED`，已有 event log 只记录 validation error，不得创建 child。Herdr CLI 仍使用 argv 数组、`shell: false`；必须验证 direct prompt 的固定 header、必要的 `--` 分隔方式和换行不会被 CLI 重新解释。
+7. prompt 和 event 都不得包含密码、Token、Cookie、私钥或其他凭据。除现有 key-based payload redaction 外，对最终发送的 prompt 执行敏感值检查；检查失败时 fail closed，并只记录长度/hash 和错误类别，不记录原文。必须在文档中明确 argv/进程列表对非凭据敏感 task 的可见性限制。
+8. `AgentTurnMonitor`、`currentRelayOutput`、Pi session fallback 和 `reconcilePartial` 必须支持 direct-v2 与 pointer-v1 双 anchor。direct-v2 需要保留 foreign-marker rejection；pointer-v1 只为兼容期内已发出的 relay 保留。direct-v2 的 completion 解析不得依赖 `COMMUNICATION FILE`。
+9. direct prompt 回显可能占用 terminal read window；`readAgent` 应支持按 prompt line count 请求足够的 recent lines，至少覆盖 direct prompt、completion contract 和固定余量。若 completion 超出窗口，必须产生有原因的 `PARTIAL`，不能静默当作无输出。
+10. 保留 Herdr 的 `wait: false`、exact session、baseline、monitor 和 semantic-DONE-gated pane disposition；本专项只替换 child payload 的来源，但会同步更新上述 identity anchor 和 terminal/session parser。
+
+### 9.4 实施阶段
+
+#### Phase A：先冻结 direct relay contract 与设计文档
+
+- 先更新 `design.md` 中与 child relay、completion anchor、event-log ownership 冲突的条款，以及 README 的对应契约；在这些文档完成前不得合并 direct relay runtime。`design.md` 仍是实现 contract，Phase A 负责先改变 contract，再实现代码。
+- 新增 parent-owned 的 direct prompt builder，输入为已校验的 normalized task/continuation/control payload，输出固定、可测试的 Herdr prompt。prompt 首行固定为 `RELAY TRANSPORT: herdr-direct-v2`，随后输出精确 `MESSAGE ID` 和 `MESSAGE TYPE` identity block。
+- 将现有 `buildRelayEnvelope` 拆成 direct-v2 prompt builder 与 pointer-v1 legacy matcher/reader 两部分；新任务不再生成 `COMMUNICATION FILE`、`MESSAGE SEQ` 或 `MESSAGE LINES` child-facing 指令，但兼容期不得删除旧 marker 的解析能力。
+- 在 `AgentTurnObservationInput`、relay runtime 和 persisted payload 中增加明确的 `relayTransport` 传播；缺省值只解释为 pointer-v1。更新 `hasRelayAnchor`、`currentRelayOutput`、Pi session matcher 和 `reconcilePartial`，按 transport 选择 anchor，并继续拒绝 foreign marker。
+- 为 `HerdrCliGateway` 增加 direct prompt 的 UTF-8 byte/line bound、非 `-` 固定 header 和换行稳定性验证；明确 shell-free argv、`--` 分隔方式（以实际 Herdr CLI probe 结果为准）和 prompt 超限时的结构化 `BLOCKED` 行为。
+- 对最终发送 prompt 执行敏感值检查，只记录长度/hash/错误类别；验证 terminal read window 能覆盖最大允许 prompt 与 completion contract，必要时让 `readAgent` 接受按 prompt 行数计算的 `lines`。
+- 保留 `messageId`、result identity、transport 和 session metadata 的日志记录，以便发送后监控、旧 relay 兼容和失败恢复；不要把 task 原文写入 debug 输出。
+
+**门槛：** design/README contract 已更新；fake gateway 能证明 direct prompt 携带完整 task、completion contract 和 identity block，prompt 不含 child 文件读取指令；direct/legacy 两种 anchor、超限 BLOCKED、leading-dash、换行、敏感值和 terminal read-window 单元测试通过。
+
+#### Phase B：切换 direct leaf
+
+- 调整 `DelegateEngine.run`：在创建 pane 或发送前先渲染并校验 direct prompt；校验通过后 append handoff event，再使用同一份 normalized payload 和已验证 prompt 通过 `HerdrCliGateway.prompt` 发送。超限、敏感值或序列化失败不得创建 child。
+- 从 persisted handoff event 读取 `relayTransport`：新 event 使用 direct-v2，旧 event 缺省走 pointer-v1。continuation、timeout、partial、Pi session fallback 和 exact-session reconciliation 必须沿用原 transport，不得把旧 in-flight relay 改写成新 transport。
+- 调整 direct-v2 continuation、timeout、partial 和 exact-session reconciliation，使重试/恢复仍使用新的 direct prompt，不重复创建 child、不替换 exact session；旧 pointer-v1 只使用只读兼容 matcher。
+- 保留 parent 对 stage event log 的读写和 replay；删除 Leaf Child 侧的文件读取前提，而不是删除 event log。完成判定继续要求 semantic `DONE`，不能只相信 Herdr idle/done 状态。
+- 为 direct delegate 增加成功、blocked、partial、session mismatch、prompt failure、结果幂等、foreign marker rejection、direct/legacy late reconciliation 和 read-window overflow 测试。
+
+**门槛：** direct leaf 在 child 无法访问通信目录的 fake/integration 场景下仍能完成；direct-v2 与旧 pointer-v1 relay 都能按各自 anchor 得到正确 completion；所有最终状态仍能从 event log replay 得到。
+
+#### Phase C：切换 pipeline coordinator relay
+
+- 调整 Parent 到 Coordinator 的 `promptInbox`、`sendBootstrap` 和 `COORDINATOR_BOOTSTRAP`：durable inbox 继续负责队列和恢复，但 Herdr 直接携带完整、已校验的 pipeline request。Coordinator 只执行一次约定的 `pipeline.coordinator` action，不再被提示去读取 `INBOX FILE` 或自行解析 pointer。
+- 调整 `promptControl`：answer、stop、recover 的 control payload 一律 inline 发送，包含 action、pipeline identity、message identity、target 和已校验参数；不再产生新的 `EVENT LOG`/`MESSAGE SEQ`/`MESSAGE LINES` pointer-v1 control prompt。
+- Coordinator 收到 prompt 后，必须使用 `pipelineId`、`messageId`、event identity、attempt 和 fence 对照 durable JSONL，再追加 `accepted` 或 control event；不能只相信 Herdr prompt 文本。
+- Coordinator 到 stage child 的 task/continuation 已由 Phase B 的 `DelegateEngine` direct builder 覆盖，本阶段只移除剩余 coordinator-specific pointer 文案并验证 transport metadata，不再维护第二套 relay 实现。
+- 保留 busy queue、bounded ACK、FIFO、stage isolation、ready-wave 并发和 stale control/fence 校验；明确 Main Parent 只读取 pipeline status/progress，stage child 不读取 pipeline 总日志或 stage JSONL。
+
+**门槛：** pipeline 在 coordinator busy、重启、重复 prompt、人工 answer/stop/recover 和 stage partial 场景下，状态仍只由 JSONL replay 得出；Coordinator 和 stage child 都不需要打开 communication 文件；control prompt 也能被重复投递而不重复执行。
+
+#### Phase D：收缩旧生成路径并同步文档
+
+- 盘点实际存在的 `buildRelayEnvelope`、`COORDINATOR_BOOTSTRAP`、`promptInbox`、`sendBootstrap`、`promptControl`、`COMMUNICATION FILE`、`MESSAGE LINES` 和 child-facing JSONL 文案引用；`record-reader.ts`、`coordinator-prompt.ts` 若不存在，不创建新模块，只在计划和文档中明确“不需要”。
+- 删除新任务生成 pointer-v1 的路径；保留一个有明确 sunset 边界的 parent/coordinator-only legacy matcher，用于兼容期内已发出的旧 relay。不得把 legacy reader 重新暴露为 Codex/Claude child 插件。
+- 同步 `design.md`、README、测试命名、debug 字段和 release/rollback material，使“JSONL 是 parent/coordinator 状态日志、Herdr 是 child 载荷传输、anchor 按 transport 版本选择”成为唯一描述。
+- `communicationFile` 继续出现在结果和诊断 metadata 中，但 child-facing direct prompt 不再要求读取它；`observation.relayAnchor` 必须标明 direct-v2 或 legacy-v1 语义，不能只用布尔值掩盖版本。
+
+#### Phase E：兼容、发布与回滚
+
+- 新 task/continuation/control event 使用 `relayTransport: "herdr-direct-v2"`；已有 JSONL 无该字段时固定按 pointer-v1 replay，不能因缺少新字段而损坏恢复。
+- 在一个 release 内保留 pointer-v1 的只读 matcher 和 Pi fallback。已经发出的旧 relay 不主动重发、不替换 exact session；其 monitor 继续按 legacy anchor 观察。新的 task、continuation、retry 和 control 不得再产生 pointer-v1。
+- 发布前建立 in-flight 边界：升级后 direct-v2 和 legacy-v1 均可观察；回滚前必须停止新 direct-v2 投递，并将仍在运行的 direct-v2 stage 显式记录为 `PARTIAL`/`BLOCKED` recovery 状态。旧 runtime 不得尝试在 direct-v2 stage 上发送 pointer prompt 或替换 exact session。
+- 若无法证明旧 runtime 不会继续 direct-v2 stage，则该版本不允许回滚，只能先完成/终止这些 stage 后再切换。回滚后保留新 JSONL、binding 和 pipeline 文件，不让旧版本猜测、转换或自动重跑新 transport 状态。
+- direct relay 的 live smoke 未通过时，按上述边界停止 direct-v2、保留 failure evidence，再回滚整个 package/runtime；旧 pointer-v1 in-flight relay 继续使用兼容 matcher。
+
+### 9.5 测试与验收矩阵
+
+| 测试层 | 验收内容 |
+| --- | --- |
+| Prompt unit | direct task/continuation/control payload、identity block、completion contract、确定性序列化、CRLF/换行、leading-dash、64 KiB/400 行边界、超限 BLOCKED、敏感值扫描；断言不存在 `COMMUNICATION FILE`、`MESSAGE SEQ`、`MESSAGE LINES` 或 child 文件读取指令 |
+| Monitor unit | direct-v2 `(relayTransport,messageId)` anchor、legacy-v1 `(communicationFile,messageId)` anchor、foreign marker rejection、缺失 anchor 的 BLOCKED/PARTIAL 语义、terminal-wrapped marker 和 completion-shaped task text |
+| Leaf integration | child 只收到 Herdr prompt；通信目录不可读时仍能从 prompt 完成；prompt 回显包含 `MESSAGE ID` 但无 `COMMUNICATION FILE` 时仍能 `DONE`；completion 超出 read window 时得到有原因的 bounded `PARTIAL` |
+| Pipeline integration | Parent/Coordinator/Leaf 的读写边界、inbox、direct request、inline answer/stop/recover、accepted、stage result 和最终汇总；重复 control prompt 不重复执行 |
+| Recovery | Parent/coordinator 重启、重复 relay、混合旧/新 event replay、direct-v2 session fallback、pointer-v1 session fallback、exact-session continuation、stale attempt/fence 和 late reconciliation |
+| Failure injection | Herdr prompt 未送达、child 未响应、prompt timeout、argv/E2BIG 或超限、leading-dash、敏感值拒绝、JSONL 写入失败、结果重复、event-log 尾行损坏和 terminal read-window overflow |
+| Rollback | 旧 runtime 遇到 direct-v2 active/partial stage 时明确拒绝或按发布边界停止；不得将 direct-v2 stage 改发 pointer prompt，不得替换 exact session |
+| Live smoke | 真实 Codex/Claude/Pi child 不读取 communication JSONL，仍能完成 direct leaf 和至少一个 pipeline stage；至少覆盖一次旧 pointer-v1 in-flight 观察和一次 direct-v2 late reconciliation |
+| Documentation | `design.md`、README、plan、debug 字段、测试命名和 rollback material 对 transport/version、state ownership、anchor 和 child boundary 的描述一致 |
+
+### 9.6 完成定义
+
+本专项只有同时满足以下条件才算完成：
+
+- 新 direct delegate、pipeline stage 和 coordinator control 都通过 Herdr 直接接收完整且已校验的 payload；
+- Leaf Child 不需要读取或写入 communication JSONL；
+- Parent/coordinator 仍是唯一 JSONL 状态和结果 writer，所有 event-log append 都受现有锁、幂等和 replay 规则约束，只读 replay 不修改文件；
+- direct-v2 与 pointer-v1 的 anchor、completion parser、Pi session fallback 和 exact-session late reconciliation 均有版本化测试；
+- `pipeline.status`、`recover`、answer/stop/recover、exact-session continuation 和 semantic-DONE-gated pane disposition 行为不回归；
+- 失败、超时、重复 prompt、超限 payload 和 coordinator 重启不会导致隐式重复执行；
+- 回滚边界已经演练，旧 runtime 不会在 direct-v2 stage 上发送 pointer prompt 或替换 exact session；
+- 文档不再把 JSONL 文件读取描述为 child 通信插件或必需能力；
+- `npm run typecheck`、完整测试、live smoke、`git diff --check` 和 `npm pack --dry-run` 均通过。

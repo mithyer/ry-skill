@@ -1,10 +1,12 @@
 import { hashDebugText } from "./debug.ts";
+import { currentRelayOutput, DIRECT_RELAY_READ_MARGIN_LINES, hasRelayAnchor } from "./relay.ts";
 import { errorCompletionContract, parseCompletionContract } from "./result.ts";
 import type {
 	AgentTransportStatus,
 	CompletionContract,
 	HerdrAgentSnapshot,
 	HerdrGateway,
+	RelayTransport,
 	SessionIdentity,
 } from "./types.ts";
 
@@ -34,6 +36,8 @@ export interface AgentTurnObservation {
 	postSubmit: boolean;
 	/** Whether a relay marker was visible in the captured output. */
 	relayAnchor: boolean;
+	/** Relay transport version observed by the monitor. */
+	relayTransport?: RelayTransport;
 	/** Exact child identity observed by Herdr. */
 	agentSession: SessionIdentity;
 	/** Pane identity observed by Herdr. */
@@ -66,6 +70,10 @@ export interface AgentTurnObservationInput {
 	communicationFile: string;
 	/** Parent-generated relay message identity. */
 	relayMessageId: string;
+	/** Persisted transport used to select direct-v2 or legacy-v1 anchor matching. */
+	relayTransport?: RelayTransport;
+	/** Direct prompt line count used to size terminal reads. */
+	relayPromptLines?: number;
 	/** Pre-relay output baseline. */
 	baseline: AgentTurnBaseline;
 	/** Absolute overall stage deadline. */
@@ -197,38 +205,31 @@ function interruptedCompletion(): CompletionContract {
 	return { ...errorCompletionContract(new Error("Child conversation was interrupted before completion contract")), status: "PARTIAL" };
 }
 
-/** Builds a whitespace-tolerant pattern for a terminal-wrapped relay marker. */
-function relayMarkerPattern(label: string, value: string): RegExp {
-	const compactMarker = `${label}:${value}`.replace(/\s+/g, "");
-	const pattern = [...compactMarker].map((character) => `${character.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`).join("");
-	return new RegExp(pattern, "i");
+/** Computes the bounded terminal window needed to include a direct prompt echo and completion contract. */
+function requestedTerminalReadLines(input: AgentTurnObservationInput): number | undefined {
+	return input.relayPromptLines === undefined ? undefined : Math.max(500, input.relayPromptLines + DIRECT_RELAY_READ_MARGIN_LINES);
 }
 
-/** Finds a relay marker even when terminal rendering inserts whitespace or line breaks. */
-function findRelayMarker(text: string, label: string, value: string): number {
-	return text.search(relayMarkerPattern(label, value));
-}
-
-/** Returns whether a capture contains both current relay pointers.
- * TEST:agent-monitor.test.ts[AgentTurnMonitor accepts terminal-wrapped current relay markers]
- */
-function hasRelayAnchor(text: string, input: AgentTurnObservationInput): boolean {
-	return relayMarkerPattern("MESSAGE ID", input.relayMessageId).test(text)
-		&& relayMarkerPattern("COMMUNICATION FILE", input.communicationFile).test(text);
-}
-
-/** Narrows terminal parsing to the current relay and rejects visible foreign relay markers.
+/** Narrows terminal parsing to the current versioned relay and rejects visible foreign markers.
  * TEST:agent-monitor.test.ts[AgentTurnMonitor rejects a foreign relay marker despite changed output]
  */
-function currentRelayOutput(text: string, input: AgentTurnObservationInput): string | undefined {
-	const messageIndex = findRelayMarker(text, "MESSAGE ID", input.relayMessageId);
-	const fileIndex = findRelayMarker(text, "COMMUNICATION FILE", input.communicationFile);
-	const hasAnyMessageMarker = /MESSAGE\s*ID\s*:/i.test(text);
-	if (input.requireRelayAnchor && !hasRelayAnchor(text, input)) return undefined;
-	if (hasAnyMessageMarker && !hasRelayAnchor(text, input)) return undefined;
-	if (messageIndex < 0 && fileIndex < 0) return text;
-	if (messageIndex < 0 || fileIndex < 0) return undefined;
-	return text.slice(Math.max(messageIndex, fileIndex));
+function currentRelayOutputForInput(text: string, input: AgentTurnObservationInput): string | undefined {
+	return currentRelayOutput(text, {
+		transport: input.relayTransport ?? "pointer-v1",
+		communicationFile: input.communicationFile,
+		relayMessageId: input.relayMessageId,
+	}, input.requireRelayAnchor ?? false);
+}
+
+/** Returns whether a capture contains the expected versioned relay identity.
+ * TEST:agent-monitor.test.ts[AgentTurnMonitor accepts terminal-wrapped current relay markers]
+ */
+function hasCurrentRelayAnchor(text: string, input: AgentTurnObservationInput): boolean {
+	return hasRelayAnchor(text, {
+		transport: input.relayTransport ?? "pointer-v1",
+		communicationFile: input.communicationFile,
+		relayMessageId: input.relayMessageId,
+	});
 }
 
 /** Shared polling monitor that separates Herdr transport hints from semantic completion. */
@@ -306,7 +307,7 @@ export class AgentTurnMonitor {
 
 			let output = "";
 			try {
-				output = (await this.dependencies.gateway.readAgent(input.target, input.signal)).text;
+				output = (await this.dependencies.gateway.readAgent(input.target, input.signal, requestedTerminalReadLines(input))).text;
 			} catch (error) {
 				lastError = error;
 				if (isDefinitivelyClosedAgentError(error)) return this.blockedResult(input, resultKey, snapshot, observations, "Herdr closed the exact agent while reading completion output");
@@ -319,14 +320,14 @@ export class AgentTurnMonitor {
 
 			const outputFingerprint = hashDebugText(output) ?? "";
 			const postSubmit = outputFingerprint !== input.baseline.fingerprint;
-			const relayAnchor = hasRelayAnchor(output, input);
+			const relayAnchor = hasCurrentRelayAnchor(output, input);
 			observations += 1;
 			await this.emitObservation(input, snapshot, attempt, previousTransport, previousFingerprint, postSubmit, relayAnchor, output);
 			previousTransport = snapshot.status;
 			previousFingerprint = outputFingerprint;
 
 			let completion: CompletionContract | undefined;
-			const relayOutput = postSubmit || relayAnchor ? currentRelayOutput(output, input) : undefined;
+			const relayOutput = postSubmit || relayAnchor ? currentRelayOutputForInput(output, input) : undefined;
 			if (relayOutput) {
 				try {
 					completion = parseCompletionContract(relayOutput);
@@ -346,7 +347,10 @@ export class AgentTurnMonitor {
 			await sleep(Math.min(pollIntervalMs, Math.max(1, Date.parse(input.deadlineAt) - Date.now())));
 		}
 
-		return this.partialResult(input, resultKey, lastSnapshot, observations, lastError ?? new Error("completion contract was not observed before the monitor budget expired"));
+		const readWindow = requestedTerminalReadLines(input);
+		return this.partialResult(input, resultKey, lastSnapshot, observations, lastError ?? new Error(readWindow === undefined
+			? "completion contract was not observed before the monitor budget expired"
+			: `completion contract was not observed in the ${readWindow}-line terminal read window before the monitor budget expired`));
 	}
 
 	/** Emits only transport/output metadata and never forwards raw child text. */
@@ -369,6 +373,7 @@ export class AgentTurnMonitor {
 			outputLength: output?.length,
 			postSubmit,
 			relayAnchor,
+			relayTransport: input.relayTransport ?? "pointer-v1",
 			agentSession: snapshot.agentSession!,
 			paneId: snapshot.paneId,
 		});

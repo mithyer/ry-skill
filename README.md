@@ -57,7 +57,7 @@ rollback material and is not registered as an active Pi skill.
 | Leaf delegation | Creates a JSONL event log, resolves profile arguments, starts one child pane through `HerdrCliGateway`, waits, validates the completion contract, and applies `close`, `keep`, or `new-tab` only after semantic `DONE`. |
 | Pipeline submission | Persists a complete request and FIFO inbox entry, then returns `QUEUED` or bounded-ack `ACCEPTED` without waiting for stage completion. |
 | Coordinator | Uses one project/workspace-bound long-lived Pi pane, exact session binding, bounded ready-wave stage ticks, workspace reservations/leases/fences/layout locks, stage-specific JSONL logs, answer/stop controls, and closed-pane exact-session recovery. Legacy stages remain serial. |
-| Communication | JSONL/NDJSON is the sole runtime source of truth. Child agents read relay-designated events; the parent/coordinator owns validation and writes. No Codex/Claude communication plugin is required. |
+| Communication | JSONL/NDJSON remains the parent/coordinator durable event log for replay, recovery, fencing, idempotency, and audit. New `herdr-direct-v2` relays carry the complete redacted task/control payload in Herdr; child agents do not read or write communication JSONL. Legacy `pointer-v1` matching remains read-only for already-issued relays. |
 | Herdr boundary | All delegate side effects pass through `HerdrCliGateway`, which uses argv arrays, explicit `cwd`/environment, cancellation/timeout, and captured stdout/stderr. Formal task relay uses `wait: false`; `AgentTurnMonitor` separately polls exact identity, transport hints, terminal output, and completion contracts. |
 | Monitoring | Leaf and pipeline stages share `ry-herdr-delegate/agent-monitor.ts`; relay baselines, observations, bounded PARTIAL outcomes, exact Pi fallback, and late reconciliation are persisted in JSONL without resending or replacing exact sessions. |
 | Recovery | Open-pane reuse and definitively closed-pane resume require the complete `agent_session` identity. Unknown or mismatched state returns `BLOCKED` or `PARTIAL`; generic latest-session fallback is not used. |
@@ -146,6 +146,18 @@ extension never creates or overwrites either file.
 The extension does not silently fall back to the old skill, an external
 `herdr_delegate`, a fresh coordinator, or a latest-session recovery command.
 
+New leaf, stage, and coordinator task/control relays use `herdr-direct-v2`:
+the prompt contains a versioned identity block and the complete redacted payload,
+while the parent or coordinator continues to persist and replay JSONL state.
+Children must not open or modify communication files. The older `pointer-v1`
+file/line marker is retained only to observe relays already sent before the
+transport migration; new work never emits that pointer envelope. Direct prompts
+are bounded to 64 KiB UTF-8 and 400 lines and fail closed as `BLOCKED` before a
+child pane is created when validation fails. Prompt text is passed through the
+shell-free Herdr argv boundary, so non-secret task content may still be visible
+to the local process table or Herdr diagnostics; credentials are redacted or
+rejected rather than included.
+
 #### Direct invocation and automatic routing
 
 `/ry-herdr-agent <task>` executes one leaf task through
@@ -208,11 +220,13 @@ npm pack --dry-run
 ```
 
 The current fake/integration coverage includes JSONL replay, exact-session
-identity, leaf pane policy, coordinator queue/tick behavior, bounded concurrent
-ready waves, reservation expiry/reconciliation, accepted receipts, answer/stop
-controls, closed-pane exact-session recovery, workspace isolation, path-safety
-checks, and coordinator bootstrap races. Live smoke against an authenticated
-Herdr workspace remains explicit validation work.
+identity, direct-v2 and legacy pointer-v1 anchors, bounded/redacted direct
+prompts, pre-pane validation failures, leaf pane policy, coordinator
+queue/tick behavior, bounded concurrent ready waves, reservation
+expiry/reconciliation, accepted receipts, answer/stop controls, closed-pane
+exact-session recovery, workspace isolation, path-safety checks, and
+coordinator bootstrap races. Live smoke against an authenticated Herdr
+workspace remains explicit validation work.
 
 ## License
 

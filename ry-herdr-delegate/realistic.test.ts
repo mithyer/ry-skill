@@ -77,7 +77,7 @@ function createScenario(sessionVisibleAfter: number): { spawnProcess: SpawnProce
 		}
 		if (scope === "agent" && operation === "prompt") {
 			const text = args[3] ?? "";
-			if (text.includes("COMMUNICATION FILE:")) formalRelaySubmitted = true;
+			if (text.includes("RELAY TRANSPORT: herdr-direct-v2")) formalRelaySubmitted = true;
 			return fakeChild(JSON.stringify({ result: { agent: agentRecord("idle", true) } }));
 		}
 		if (scope === "agent" && operation === "wait") {
@@ -134,7 +134,9 @@ test("realistic Claude delegate completes through the Herdr CLI boundary", async
 		const promptCalls = scenario.calls.filter(([scope, operation]) => scope === "agent" && operation === "prompt");
 		assert.equal(promptCalls.length, 2);
 		assert.match(promptCalls[0][3] ?? "", /^RY_HERDR_SESSION_BOOTSTRAP:/);
-		assert.match(promptCalls[1][3] ?? "", /COMMUNICATION FILE:/);
+		assert.match(promptCalls[1][3] ?? "", /^RELAY TRANSPORT: herdr-direct-v2/);
+		assert.match(promptCalls[1][3] ?? "", /run a no-side-effect realistic smoke/);
+		assert.doesNotMatch(promptCalls[1][3] ?? "", /COMMUNICATION FILE:|MESSAGE LINES:/);
 		assert.equal(scenario.calls.filter(([scope, operation]) => scope === "agent" && operation === "wait").length, 1);
 		assert.equal(scenario.calls.filter(([scope, operation]) => scope === "agent" && operation === "read").length, 2);
 		assert.deepEqual(scenario.calls.at(-1), ["pane", "move", "w-test:p2", "--new-tab", `--label`, `closed-pane-${result.communicationId}`, "--workspace", "w-test", "--no-focus"]);

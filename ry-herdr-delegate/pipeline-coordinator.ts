@@ -3,10 +3,11 @@ import { realpath } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 
 import { buildFinalAgentArgs } from "./args.ts";
+import { buildDirectRelayPrompt, DIRECT_RELAY_TRANSPORT, RelayPromptValidationError } from "./relay.ts";
 import { DelegateEngine } from "./engine.ts";
 import { resolveAgentProfile, type ConfigCapabilities } from "./config.ts";
 import { debug, debugError, hashDebugText } from "./debug.ts";
-import { createEventLog } from "./records.ts";
+import { createEventLog, readEventLog } from "./records.ts";
 import { canonicalCwdResourceKey, WorkspaceReservationLedger, type ReservationProjection } from "./concurrency.ts";
 import type {
 	CoordinatorBinding,
@@ -19,6 +20,8 @@ import type {
 	PipelineControlResult,
 	PipelineControlTarget,
 	PipelineStageInput,
+	PipelineStatus,
+	RelayTransport,
 	SessionIdentity,
 } from "./types.ts";
 import { PipelineStore, type PipelineInboxEntry, type PipelineProgress, type PipelineRequestInput } from "./pipeline.ts";
@@ -29,8 +32,10 @@ const COORDINATOR_ROLE = "delegate";
 /** Fixed coordinator bootstrap contract; the structured runtime exclusively owns durable JSONL writes. */
 export const COORDINATOR_BOOTSTRAP = [
 	"You are the long-lived pipeline coordinator for this project and Herdr workspace.",
-	"When you receive an inbox or control pointer, call ry_herdr_delegate_tool exactly once with action pipeline.coordinator.",
-	"The structured tool replays the durable inbox, performs leaf delegation, and appends every receipt, checkpoint, result, blocker, and final summary.",
+	"When a direct-v2 relay prompt arrives, call ry_herdr_delegate_tool exactly once with action pipeline.coordinator.",
+	"For a request or control payload, pass its pipelineId and relayMessageId to the structured tool so it can verify the durable event before acting.",
+	"The prompt carries the complete validated request or control payload; use its pipelineId and relayMessageId only to correlate the durable queue and event log.",
+	"The structured tool replays durable state, performs leaf delegation, and appends every receipt, checkpoint, result, blocker, and final summary.",
 	"Do not directly read, write, append, edit, or repair pipeline JSONL, inbox files, coordinator state, or any other filesystem state.",
 	"Do not submit a pipeline, create another coordinator, delegate recursively, or use shell commands for coordination.",
 	"Report the structured tool result and keep this coordinator pane open.",
@@ -237,16 +242,22 @@ export class PipelineCoordinator {
 		}
 	}
 
-	/** Sends bootstrap only to a newly created or explicitly idle coordinator. */
+	/** Sends a direct-v2 bootstrap payload to a newly created coordinator. */
 	private async sendBootstrap(binding: CoordinatorBinding, signal?: AbortSignal): Promise<void> {
-		const relay = [
-			`INBOX FILE: ${binding.inboxPath}`,
-			"INBOX FORMAT: JSONL",
-			"MESSAGE TYPE: coordinator-bootstrap",
-			"",
-			COORDINATOR_BOOTSTRAP,
-		].join("\n");
-		await this.dependencies.gateway.prompt({ target: binding.agent, text: relay, wait: false, signal });
+		const messageId = `coordinator-bootstrap-${randomUUID()}`;
+		const relay = buildDirectRelayPrompt({
+			messageId,
+			messageType: "coordinator-bootstrap",
+			payload: {
+				relayTransport: DIRECT_RELAY_TRANSPORT,
+				action: "pipeline.coordinator",
+				workspaceId: binding.workspaceId,
+				coordinatorPaneId: binding.paneId,
+				coordinatorAgent: binding.agent,
+			},
+			instructions: [...COORDINATOR_BOOTSTRAP.split("\n"), "Call ry_herdr_delegate_tool exactly once with action pipeline.coordinator when a queue or control payload is available."],
+		});
+		await this.dependencies.gateway.prompt({ target: binding.agent, text: relay.text, wait: false, signal });
 	}
 
 	/** Persists a full pipeline request, then appends a compact inbox entry without waiting for stage work. */
@@ -312,6 +323,7 @@ export class PipelineCoordinator {
 		let binding = handle.binding;
 		let shouldWaitForAccepted = false;
 		let relayError: string | undefined;
+		let relayBlocked = false;
 		await store.withLock(async () => {
 			const currentBinding = await store.read();
 			if (!currentBinding) throw new Error("Coordinator binding disappeared after pipeline enqueue");
@@ -324,10 +336,18 @@ export class PipelineCoordinator {
 				}
 			} catch (error) {
 				relayError = error instanceof Error ? error.message : String(error);
+				relayBlocked = error instanceof RelayPromptValidationError;
 			}
 		});
 		if (relayError) {
-			const result = this.dependencies.pipelineStore.submission(entry, binding, "PARTIAL", relayError);
+			const relayStatus: PipelineStatus = relayBlocked ? "BLOCKED" : "PARTIAL";
+			// Persist a terminal submission failure so status replay does not leave a rejected relay QUEUED forever.
+			await this.dependencies.pipelineStore.appendPipelineEvent(entry.pipelineId, "status-changed", "parent", {
+				status: relayStatus,
+				error: relayError,
+				reason: relayBlocked ? "direct-relay-validation" : "coordinator-relay-failure",
+			}).catch(() => undefined);
+			const result = this.dependencies.pipelineStore.submission(entry, binding, relayStatus, relayError);
 			await debug.log("coordinator.submit.result", { pipelineId, status: result.status, communicationFile: result.communicationFile, error: relayError }, "warn");
 			return result;
 		}
@@ -357,18 +377,32 @@ export class PipelineCoordinator {
 		return false;
 	}
 
-	/** Sends only a durable inbox pointer when coordinator transport is idle. */
+	/** Sends the complete validated pipeline request inline while retaining the durable inbox for replay and deduplication. */
 	private async promptInbox(binding: CoordinatorBinding, entry: PipelineInboxEntry, signal?: AbortSignal): Promise<void> {
-		const relay = [
-			`INBOX FILE: ${binding.inboxPath}`,
-			`PIPELINE ID: ${entry.pipelineId}`,
-			`INBOX LINE: ${entry.enqueueSeq}`,
-			`EVENT LOG: ${entry.communicationFile}`,
-			"MESSAGE TYPE: pipeline-queued",
-			"",
-			"Read this inbox entry and acknowledge it by appending an accepted event to the pipeline JSONL event log.",
-		].join("\n");
-		await this.dependencies.gateway.prompt({ target: binding.agent, text: relay, wait: false, signal });
+		const progress = await this.dependencies.pipelineStore.readProgress(entry.pipelineId, this.dependencies.config.pipelines.default.maxStages, binding.writerFence);
+		const relay = buildDirectRelayPrompt({
+			messageId: entry.messageId,
+			messageType: "pipeline-queued",
+			payload: {
+				relayTransport: DIRECT_RELAY_TRANSPORT,
+				action: "pipeline.coordinator",
+				pipelineId: entry.pipelineId,
+				relayMessageId: entry.messageId,
+				request: progress.request,
+				inbox: {
+					pipelineId: entry.pipelineId,
+					enqueueSeq: entry.enqueueSeq,
+					messageSeq: entry.messageSeq,
+					lineStart: entry.lineStart,
+					lineEnd: entry.lineEnd,
+					lineCount: entry.lineCount,
+					queueState: entry.queueState,
+					messageId: entry.messageId,
+				},
+			},
+			instructions: ["Call ry_herdr_delegate_tool exactly once with action pipeline.coordinator, passing pipelineId and relayMessageId from the payload; do not acknowledge the request from prompt text alone."],
+		});
+		await this.dependencies.gateway.prompt({ target: binding.agent, text: relay.text, wait: false, signal });
 	}
 
 	/**
@@ -454,7 +488,12 @@ export class PipelineCoordinator {
 		}, controlId, { stageId: selected?.stageId, stageRole: selected?.role ?? "pipeline", stageOccurrence: (selected?.stageIndex ?? 0) + 1, attempt: selected?.attempt, fencingToken: selected?.fencingToken, schemaVersion: 2 });
 		const current = await this.dependencies.gateway.getAgent(binding.agent, signal);
 		if (current.status === "idle" || current.status === "done") {
-			await this.promptControl(binding, progress.state.communicationFile, appended, `pipeline-${action}`, signal);
+			try {
+				await this.promptControl(binding, pipelineId, progress.state.communicationFile, appended, `pipeline-${action}`, signal);
+			} catch (error) {
+				if (error instanceof RelayPromptValidationError) return { status: "BLOCKED", pipelineId, communicationFile: progress.state.communicationFile, targetStageId: selected?.stageId, controlId, error: error.message };
+				throw error;
+			}
 			return { status: action === "stop" ? "STOPPED" : "ACCEPTED", pipelineId, communicationFile: progress.state.communicationFile, targetStageId: selected?.stageId, controlId };
 		}
 		if (current.status === "working" || current.status === "blocked") return { status: action === "stop" ? "STOPPED" : "QUEUED", pipelineId, communicationFile: progress.state.communicationFile, targetStageId: selected?.stageId, controlId };
@@ -529,7 +568,12 @@ export class PipelineCoordinator {
 			}, messageId, { stageId: stage.stageId, stageRole: stage.role, stageOccurrence: stage.stageIndex + 1, attempt: stage.attempt, fencingToken: stage.fencingToken, agentSession: stage.agentSession, schemaVersion: 2 });
 			const coordinatorSnapshot = await this.dependencies.gateway.getAgent(binding.agent, signal);
 			if (coordinatorSnapshot.status === "idle" || coordinatorSnapshot.status === "done") {
-				await this.promptControl(binding, progress.state.communicationFile, appended, "pipeline-recover", signal);
+				try {
+					await this.promptControl(binding, pipelineId, progress.state.communicationFile, appended, "pipeline-recover", signal);
+				} catch (error) {
+					if (error instanceof RelayPromptValidationError) return { status: "BLOCKED", pipelineId, communicationFile: progress.state.communicationFile, currentStage: stage.role, error: error.message };
+					throw error;
+				}
 				return { status: "ACCEPTED", pipelineId, communicationFile: progress.state.communicationFile, currentStage: stage.role };
 			}
 			if (coordinatorSnapshot.status === "working" || coordinatorSnapshot.status === "blocked") return { status: "QUEUED", pipelineId, communicationFile: progress.state.communicationFile, currentStage: stage.role };
@@ -538,25 +582,62 @@ export class PipelineCoordinator {
 	}
 
 
-	async tickCurrent(projectRoot: string, workspaceId: string, callerPaneId: string, callerSession: SessionIdentity, signal?: AbortSignal): Promise<PipelineControlResult> {
+	/** Executes one coordinator tick only after optional direct-v2 relay identity is matched to durable state.
+	 *
+	 * @param projectRoot Project root bound to the coordinator.
+	 * @param workspaceId Herdr workspace bound to the coordinator.
+	 * @param callerPaneId Pane from which the structured coordinator action executes.
+	 * @param callerSession Exact Pi session identity of the caller.
+	 * @param signal Optional cancellation signal.
+	 * @param relay Optional pipeline/message identity carried by a direct-v2 prompt.
+	 * @returns Durable coordinator tick result.
+	 * TEST:coordinator.test.ts[PipelineCoordinator validates direct relay identity before ticking]
+	 */
+	async tickCurrent(projectRoot: string, workspaceId: string, callerPaneId: string, callerSession: SessionIdentity, signal?: AbortSignal, relay?: { pipelineId?: string; relayMessageId?: string; transport?: RelayTransport }): Promise<PipelineControlResult> {
 		const binding = await this.existingBinding(projectRoot, workspaceId, signal);
 		if (binding.paneId !== callerPaneId || !sameSession(binding.agentSession, callerSession)) return { status: "BLOCKED", error: "pipeline.coordinator requires the exact coordinator pane and session" };
+		const hasPipelineId = Boolean(relay?.pipelineId);
+		const hasMessageId = Boolean(relay?.relayMessageId);
+		if (hasPipelineId !== hasMessageId) return { status: "BLOCKED", error: "direct coordinator relay requires both pipelineId and relayMessageId" };
+		if (hasPipelineId && hasMessageId) {
+			try {
+				await this.dependencies.pipelineStore.validateRelayMessage(relay!.pipelineId!, relay!.relayMessageId!, relay!.transport ?? DIRECT_RELAY_TRANSPORT);
+			} catch (error) {
+				return { status: "BLOCKED", error: error instanceof Error ? error.message : String(error) };
+			}
+		}
 		return this.tick(binding, signal);
 	}
 
-	/** Sends a fixed JSONL event pointer to an idle coordinator without copying task text. */
-	private async promptControl(binding: CoordinatorBinding, communicationFile: string, appended: { lineStart: number; lineEnd: number; lineCount: number; event: { messageId?: string } }, messageType: string, signal?: AbortSignal): Promise<void> {
-		const relay = [
-			`EVENT LOG: ${communicationFile}`,
-			`MESSAGE SEQ: ${appended.lineStart}`,
-			`MESSAGE LINES: ${appended.lineStart}-${appended.lineEnd}`,
-			`MESSAGE LINE COUNT: ${appended.lineCount}`,
-			`MESSAGE ID: ${appended.event.messageId ?? "none"}`,
-			`MESSAGE TYPE: ${messageType}`,
-			"",
-			"Read and replay this JSONL event before acting. Do not interleave prompts while working.",
-		].join("\n");
-		await this.dependencies.gateway.prompt({ target: binding.agent, text: relay, wait: false, signal });
+	/** Sends a complete inline control payload while retaining the event log as the execution authority. */
+	private async promptControl(
+		binding: CoordinatorBinding,
+		pipelineId: string,
+		communicationFile: string,
+		appended: { lineStart: number; lineEnd: number; lineCount: number; event: { messageId?: string } },
+		messageType: string,
+		signal?: AbortSignal,
+	): Promise<void> {
+		const messageId = appended.event.messageId;
+		if (!messageId) throw new Error("pipeline control event is missing messageId");
+		const snapshot = await readEventLog(communicationFile);
+		const located = [...snapshot.events].reverse().find(({ event }) => event.messageId === messageId);
+		if (!located) throw new Error(`pipeline control event ${messageId} is missing from the durable event log`);
+		const parentOnlyKeys = new Set(["communicationFile", "previousCommunication", "previousPaneId", "previousAgent", "previousSession"]);
+		const controlPayload = Object.fromEntries(Object.entries(located.event.payload).filter(([key]) => !parentOnlyKeys.has(key)));
+		const relay = buildDirectRelayPrompt({
+			messageId,
+			messageType,
+			payload: {
+				...controlPayload,
+				relayTransport: DIRECT_RELAY_TRANSPORT,
+				action: "pipeline.coordinator",
+				pipelineId,
+				relayMessageId: messageId,
+			},
+			instructions: ["Call ry_herdr_delegate_tool exactly once with action pipeline.coordinator, passing pipelineId and relayMessageId from the payload; use the durable event log to validate identity before applying the control."],
+		});
+		await this.dependencies.gateway.prompt({ target: binding.agent, text: relay.text, wait: false, signal });
 	}
 
 	private createLeafEngine(): DelegateEngine {

@@ -112,6 +112,9 @@ test("HerdrCliGateway uses the validated spawn boundary", async () => {
 	assert.equal(fireAndForget?.agentSession?.value, "session-test");
 	const output = await gateway.readAgent(started.agent);
 	assert.equal(output.text, "terminal output\n");
+	await gateway.readAgent(started.agent, undefined, 900);
+	const expandedReadCall = calls.filter((call) => call.args[0] === "agent" && call.args[1] === "read").at(-1);
+	assert.deepEqual(expandedReadCall?.args.slice(-6), ["--source", "recent-unwrapped", "--lines", "900", "--format", "text"]);
 	await gateway.movePane({
 		paneId: started.paneId,
 		newTab: true,

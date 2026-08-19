@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
+import { DIRECT_RELAY_TRANSPORT } from "./relay.ts";
 import { appendEvent, communicationIdFromPath, createEventLog, createEventLogEvent, readEventLog } from "./records.ts";
 import { debug, debugError, hashDebugText } from "./debug.ts";
 import type {
@@ -18,6 +19,7 @@ import type {
 	PipelineStageInput,
 	PipelineStatus,
 	PipelineSubmission,
+	RelayTransport,
 	SessionIdentity,
 	StageAccess,
 } from "./types.ts";
@@ -346,6 +348,7 @@ export class PipelineStore {
 			stageRole: "pipeline",
 			stageOccurrence: 1,
 			payload: {
+				relayTransport: DIRECT_RELAY_TRANSPORT,
 				pipelineId,
 				task: input.task,
 				// Persist the normalized plan rather than re-deriving legacy dependencies on replay.
@@ -497,6 +500,8 @@ export class PipelineStore {
 			...(metadata.agentSession ? { agentSession: metadata.agentSession } : {}),
 			payload: {
 				...payload,
+				// New coordinator events default to direct-v2; explicit legacy values remain replay-compatible.
+				relayTransport: payload.relayTransport ?? DIRECT_RELAY_TRANSPORT,
 				...(metadata.stageId ? { stageId: metadata.stageId } : {}),
 				...(metadata.attempt !== undefined ? { attempt: metadata.attempt } : {}),
 				...(metadata.fencingToken ? { fencingToken: metadata.fencingToken } : {}),
@@ -509,6 +514,26 @@ export class PipelineStore {
 			throw error;
 		}
 	}
+	/**
+	 * Verifies that a coordinator relay identity resolves to the expected durable event and transport.
+	 *
+	 * @param pipelineId Path-safe pipeline identity whose event log is authoritative.
+	 * @param messageId Relay message identity supplied by the coordinator prompt.
+	 * @param transport Expected versioned relay transport.
+	 * @returns Resolves when the identity is valid.
+	 * @throws When the message is absent, belongs to another transaction, or uses another transport.
+	 * TEST:pipeline.test.ts[PipelineStore round-trips a normalized default stage and inbox pointer]
+	 */
+	async validateRelayMessage(pipelineId: string, messageId: string, transport: RelayTransport = DIRECT_RELAY_TRANSPORT): Promise<void> {
+		const communicationFile = this.pipelinePath(pipelineId);
+		const snapshot = await readEventLog(communicationFile);
+		const located = snapshot.events.find(({ event }) => event.messageId === messageId);
+		const payloadPipelineId = located?.event.payload.pipelineId;
+		if (!located || (located.event.transaction !== pipelineId && payloadPipelineId !== pipelineId)) throw new Error(`Pipeline ${pipelineId} has no durable relay message ${messageId}`);
+		const persistedTransport = located.event.payload.relayTransport ?? "pointer-v1";
+		if (persistedTransport !== transport) throw new Error(`Pipeline ${pipelineId} relay ${messageId} uses ${String(persistedTransport)}, expected ${transport}`);
+	}
+
 	/** Reads and validates the complete pipeline task event. */
 	async readRequest(pipelineId: string, maxStages: number): Promise<PipelineRequest> {
 		const communicationFile = this.pipelinePath(pipelineId);

@@ -20,8 +20,10 @@ runtime boundaries are:
 - `HerdrCliGateway` is the only delegate Herdr transport and uses Node
   `child_process.spawn` with `shell: false`, argv arrays, explicit `cwd` and
 environment, cancellation/timeout, and captured output.
-- JSONL/NDJSON event logs are the only authoritative communication and state
-  format for the new runtime.
+- JSONL/NDJSON event logs remain the authoritative parent/coordinator state,
+  recovery, and audit format; new `herdr-direct-v2` prompts carry complete
+  redacted child payloads directly, while old `pointer-v1` markers are
+  read-only compatibility for already-issued relays.
 - `DelegateEngine` owns one leaf stage, exact session checkpoints, completion
   contract parsing, and semantic-DONE-gated pane disposition.
 - `PipelineCoordinator` owns project/workspace-bound coordinator binding,
@@ -33,8 +35,9 @@ environment, cancellation/timeout, and captured output.
   existing exact coordinator binding; it refuses a fresh replacement session
   when no binding exists.
 - Codex, Claude, and other children do not need a communication-file plugin.
-  The parent/coordinator owns JSONL validation and writes; children consume
-  relay-designated events and return the fixed completion contract.
+  The parent/coordinator owns JSONL validation and writes; children consume the
+  complete Herdr prompt and return the fixed completion contract without
+  reading or modifying communication JSONL.
 - The package does not call `@andrewjacop/pi-herdr` or
   `@ogulcancelik/pi-herdr` for delegate runtime behavior.
 
@@ -78,8 +81,9 @@ do not override the TypeScript runtime contract.
 ## Current Validation Scope
 
 The current implementation has automated coverage for configuration and argv
-resolution, JSONL append/replay and idempotency, leaf completion and pane
-policy, exact-session mismatch blocking, coordinator queue/tick behavior,
-accepted acknowledgements, answer/stop control events, closed-pane exact
-coordinator recovery, workspace isolation, path-safety checks, and coordinator
-bootstrap races. Live smoke remains explicit validation work.
+resolution, direct-v2/pointer-v1 anchors, bounded/redacted direct prompts,
+JSONL append/replay and idempotency, leaf completion and pane policy,
+exact-session mismatch blocking, coordinator queue/tick behavior, accepted
+acknowledgements, answer/stop control events, closed-pane exact coordinator
+recovery, workspace isolation, path-safety checks, and coordinator bootstrap
+races. Live smoke remains explicit validation work.

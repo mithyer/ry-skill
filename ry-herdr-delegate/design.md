@@ -141,11 +141,10 @@ ry-herdr-delegate/
   args.ts                  # agentArgs 与 exact resume args
   engine.ts                # leaf delegation orchestration
   pipeline.ts              # coordinator 侧 stage 规划和隔离
-  pipeline-coordinator.ts  # coordinator session 的提交、唤醒和生命周期
+  pipeline-coordinator.ts  # coordinator 提交、唤醒、控制和 direct-v2 relay 生命周期
   coordinator-store.ts     # project/workspace 绑定、队列和持久状态
-  coordinator-prompt.ts    # coordinator bootstrap 和 relay envelope
+  relay.ts                 # direct-v2 prompt、pointer-v1 兼容和版本化 anchor
   records.ts               # JSONL event log、追加、重放和锁
-  record-reader.ts         # 共享只读解析/校验；可承载可选 record read 命令
   recovery.ts              # open-pane reuse 和 exact-session resume
   result.ts                # child 输出与语义结果解析
   pane-policy.ts           # stage 的 close、keep、new-tab
@@ -171,7 +170,7 @@ interface HerdrGateway {
     timeoutMs: number,
   ): Promise<PaneStatus>;
   getAgent(agent: AgentTarget): Promise<AgentSnapshot>;
-  readAgent(agent: AgentTarget): Promise<AgentOutput>;
+  readAgent(agent: AgentTarget, signal?: AbortSignal, lines?: number): Promise<AgentOutput>;
   createTab(input: CreateTabInput): Promise<Tab>;
   movePane(input: MovePaneInput): Promise<void>;
   closePane(pane: PaneTarget): Promise<void>;
@@ -206,7 +205,7 @@ spawn("herdr", argv, {
 1. `herdr pane split --current ...` 创建 child pane；
 2. `herdr agent start <name> --kind <kind> --pane <pane> -- <agentArgs...>` 启动 child；
 3. 等待 child 达到可接受的初始状态；
-4. `herdr agent prompt <target> <relay-envelope>` 发送 relay prompt；
+4. `herdr agent prompt <target> <direct-v2-prompt>` 发送完整 direct relay；旧 in-flight 请求才使用 pointer-v1 envelope；
 5. `herdr agent wait <target> ...` 等待状态变化；
 6. `herdr agent get <target>` 获取 pane、agent 和 `agent_session`；
 7. `herdr agent read <target>` 捕获 child 输出；
@@ -266,7 +265,7 @@ finalArgs = normalArgs + resumeArgs
 3. 如果 coordinator 不存在，使用当前 pane 作为 source 创建一个 sibling pane，并启动一个独立的 Pi child session；只有 exact session、pane 和 workspace metadata 验证成功后才发布 binding；
 4. 如果 coordinator pane 明确关闭，使用 binding 中的 exact `agent_session` 精确恢复；
 5. 如果 pane/session metadata 暂时未知，保留旧 binding 并返回 `BLOCKED` 或 `PARTIAL`，不能创建 fresh coordinator 覆盖原绑定；
-6. 在同一持久化事务中创建 pipeline JSONL event log 并写入完整请求，再写入一个只包含 `pipelineId`、enqueue sequence、event log 路径/范围和当前状态的轻量 inbox entry。完整请求只有 event log 是 authoritative source；
+6. 在同一持久化事务中创建 pipeline JSONL event log 并写入完整请求，再写入一个只包含 `pipelineId`、enqueue sequence、event log 路径/范围和当前状态的轻量 inbox entry。完整请求只有 event log 是 authoritative source；发送给 coordinator 的新 relay 使用包含完整 request 的 direct-v2 prompt；
 7. 检查 coordinator 的 exact session 和 transport state：
    - `working` 或 `blocked`：不得发送新的 prompt；依靠 coordinator 在当前 stage 安全边界读取 inbox，立即返回 `QUEUED`；
    - `idle` 或刚完成启动且已验证可接收 prompt：发送 relay envelope；`done` 只有在 get/snapshot 确认 pane 仍打开且 exact session 可复用时才按 `idle` 处理；
@@ -340,7 +339,7 @@ coordinator 调用 leaf `delegate` 时执行以下流程：
 3. 将完整 stage handoff 写入 JSONL event log；
 4. 构造并校验 `agentArgs`；
 5. 以 coordinator pane 为 source 创建 stage pane 并启动 child；
-6. 发送只含 JSONL event log 路径和精确范围的 relay envelope；
+6. 复用已验证的 normalized payload 发送完整 direct-v2 prompt；只有已发出的旧 pointer-v1 relay 才继续使用 JSONL 路径和精确范围 marker；
 7. 由 coordinator 等待 child 状态变化；
 8. 每次 wait 返回后执行 checkpoint、session lookup 和输出捕获；
 9. 解析 child completion contract；
@@ -451,33 +450,37 @@ coordinator event log 的消息方向包括 `PARENT -> COORDINATOR`、`COORDINAT
 
 不能让主 Pi、coordinator 和 stage child 无锁地同时修改同一 event log。父进程内的 `RecordStore` 只是这个跨进程锁协议和 event replay 的调用封装，不是只存在于某一个进程内存中的互斥量。child v1 不直接写 event log；coordinator/parent 捕获 child 输出后以 `child-output-capture` 或 `result` 事件作为唯一 result writer。
 
-### 9.3 Child 读取与 relay envelope
+### 9.3 Child 输入与 relay transport
 
-Codex、Claude 和其他 child 不实现各自的通信插件，不负责完整 event log 的写入、状态重放或恢复。child 只读取 relay 指定的事件，执行任务，并返回既定 completion contract。普通文件读取是 v1 的默认方式；如果实际 smoke 证明解析不稳定，可以提供 parent-owned 的共享只读 `ry-herdr-record read` 命令，复用 `record-reader.ts`，负责路径归属、JSON schema、`seq`、`messageId` 和行范围校验。该命令不是 Codex/Claude 专用插件，也不是状态 owner。
+Codex、Claude 和其他 child 不实现各自的通信插件，不负责完整 event log 的写入、状态重放或恢复。JSONL 仍是 parent/coordinator 的持久状态、审计、幂等、fencing 和恢复事实来源；child-facing transport 与该 event log 解耦。
+
+新发送使用 `herdr-direct-v2`。parent 或 coordinator 先完整写入并验证 task、continuation 或 control event，再复用同一份规范化、脱敏后的 payload，构造包含 `RELAY TRANSPORT`、`MESSAGE ID`、`MESSAGE TYPE` 和 `RELAY PAYLOAD JSON` 的完整 Herdr prompt。direct-v2 prompt 还必须通过 UTF-8 字节数、行数和敏感值检查；失败时在创建 pane 或发送 prompt 前返回 `BLOCKED`。child 只读取 Herdr prompt，不读取或修改 communication JSONL，并返回固定的 `STATUS`、`SUMMARY`、`VALIDATION` completion contract。
+
+```text
+RELAY TRANSPORT: herdr-direct-v2
+MESSAGE ID: <message-id>
+MESSAGE TYPE: task
+RELAY PAYLOAD JSON:
+{"task":"...","stageRole":"worker", ...}
+
+Execute the complete task described by the relay payload.
+Do not read or modify communication JSONL.
+Return exactly these three headings, each on its own line:
+STATUS: DONE|BLOCKED|PARTIAL|ERROR
+SUMMARY: <one-line result>
+VALIDATION: <commands or checks performed>
+```
+
+`pointer-v1` 只作为已经发出的旧 relay 的兼容协议：它包含 communication 文件路径、物理行范围、行数、message id 和 message type，旧 child 可读取指定事件，但 parent/coordinator 仍是唯一 event-log writer。新 task、continuation 和 control 不得生成 pointer-v1；缺少 `relayTransport` 的历史事件按 pointer-v1 解释。监控、Pi session fallback 和 partial reconciliation 在迁移窗口同时识别 direct-v2 `(relayTransport, messageId)` anchor 与旧 `(communicationFile, messageId)` anchor，并拒绝 foreign 或混合 marker。
 
 每次发送任务前必须：
 
-1. 完整写入 parent handoff event；
-2. 重新读取并校验实际 event 的 `messageId`、`seq` 和物理行范围；
-3. 记录 message id、序号、起止行和行数；
-4. 仅把 relay envelope 发送给 child。
+1. 完整写入 parent/coordinator handoff event，并记录 `relayTransport`；
+2. 重新读取并校验实际 event 的 identity、物理范围和 normalized payload；
+3. 对 direct-v2 复用该 normalized payload，对 pointer-v1 仅发送精确 event-log pointer；
+4. 记录 message id、transport、序号、起止行和行数，随后才创建或唤醒 child pane。
 
-relay envelope 只包含：
-
-```text
-COMMUNICATION FILE: /absolute/path/to/record.jsonl
-MESSAGE SEQ: 12
-MESSAGE LINES: 12-12
-MESSAGE LINE COUNT: 1
-MESSAGE ID: <message-id>
-MESSAGE TYPE: task
-
-Read and parse this JSONL event before acting.
-Return the required completion contract.
-Do not delegate recursively.
-```
-
-任务正文、角色合同、pipeline 上下文、约束和完成合同都必须先写入 event log，不能复制进 relay prompt。child 不能因为使用 Codex 或 Claude 就获得额外的 event-log 写入权限或协议分支。
+通信文件路径在 direct-v2 中仍保留为 event-log、诊断和 exact-session reconciliation metadata，但不是 child 获取 task 正文的输入通道。child 不能因为使用 Codex 或 Claude 就获得额外的 event-log 写入权限或协议分支。
 
 ## 10. Session isolation 与恢复
 
@@ -593,11 +596,10 @@ closed-pane-<communicationId>
 | `package.json` | 从 `pi.skills` 移除 active `ry-herdr-delegate`，并将 `ry-herdr-delegate/index.ts` 加入 `pi.extensions`；同步更新 `files`、test script 和 runtime dependency |
 | `ry-herdr-delegate/herdr/fixtures/` | 保存 Phase 0 capability probe fixtures |
 | `ry-herdr-delegate/tsconfig.json` 或仓库级 `tsconfig.json` | 新增 runtime extension 的类型检查配置 |
-| `ry-herdr-delegate/pipeline-coordinator.ts` | coordinator session 的 bootstrap、队列唤醒、提交回执和恢复 |
+| `ry-herdr-delegate/pipeline-coordinator.ts` | coordinator session 的提交、唤醒、控制和 direct-v2 relay |
 | `ry-herdr-delegate/coordinator-store.ts` | project/workspace binding、inbox、pipeline 状态和锁 |
-| `ry-herdr-delegate/coordinator-prompt.ts` | 长期 coordinator 的固定角色合同和 relay envelope |
+| `ry-herdr-delegate/relay.ts` | direct-v2 完整 prompt、pointer-v1 兼容和版本化 completion anchor |
 | `ry-herdr-delegate/records.ts` | JSONL event log、append/replay、幂等校验和 sidecar lock |
-| `ry-herdr-delegate/record-reader.ts` | 只读 event/message 校验；必要时供 `ry-herdr-record read` 共享命令使用 |
 | `ry-herdr-delegate/SKILL.md` | 旧版本回滚材料；新 runtime 不把它作为 communication 或 delegation owner |
 | `README.md` | 更新安装、使用、配置和架构说明 |
 | `package.json` | 不添加两个 `pi-herdr` 包作为 runtime dependency；`proper-lockfile` 作为 runtime dependency 并按 Pi package 规则加入 bundledDependencies |

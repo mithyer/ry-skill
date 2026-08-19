@@ -5,7 +5,8 @@ import test from "node:test";
 
 import { parseDelegateConfig } from "./config.ts";
 import { COORDINATOR_BOOTSTRAP, PipelineCoordinator } from "./pipeline-coordinator.ts";
-import { appendEvent, createEventLog, createEventLogEvent } from "./records.ts";
+import { DIRECT_RELAY_TRANSPORT } from "./relay.ts";
+import { appendEvent, createEventLog, createEventLogEvent, readEventLog } from "./records.ts";
 import { PipelineStore } from "./pipeline.ts";
 import type {
 	CreateTabInput,
@@ -259,7 +260,10 @@ test("PipelineCoordinator returns ACCEPTED only after a bounded coordinator ackn
 		let store: PipelineStore;
 		const gateway = new CoordinatorFakeGateway(async (prompt) => {
 			if (prompt.text.includes("MESSAGE TYPE: pipeline-queued")) {
-				const pipelineId = prompt.text.match(/PIPELINE ID: ([^\n]+)/)?.[1];
+				assert.match(prompt.text, /^RELAY TRANSPORT: herdr-direct-v2/);
+				assert.match(prompt.text, /"relayMessageId":"pipeline-task-/);
+				assert.doesNotMatch(prompt.text, /INBOX FILE:|EVENT LOG:|MESSAGE LINES:/);
+				const pipelineId = prompt.text.match(/"pipelineId":"([^"]+)"/)?.[1];
 				if (pipelineId) await store.appendPipelineEvent(pipelineId, "accepted", "coordinator", { queueState: "accepted" });
 			}
 		});
@@ -270,6 +274,36 @@ test("PipelineCoordinator returns ACCEPTED only after a bounded coordinator ackn
 		const state = await store.readState(submission.pipelineId);
 		assert.equal(state.status, "ACCEPTED");
 		assert.ok(state.acceptedSeq);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+/** Verifies a coordinator direct-v2 prompt must match a durable pipeline message before ticking stages. */
+test("PipelineCoordinator validates direct relay identity before ticking", async () => {
+	const root = await mkdtemp(join("/tmp", "ry-herdr-coordinator-relay-identity-"));
+	try {
+		const gateway = new CoordinatorFakeGateway();
+		const created = await makeCoordinator(root, gateway);
+		const submission = await created.coordinator.submit({ task: "validate coordinator relay" }, root, "w-test", "w-test:p-parent", root);
+		const binding = await created.store.coordinatorStore.read();
+		assert.ok(binding);
+		const invalid = await created.coordinator.tickCurrent(root, "w-test", binding.paneId, binding.agentSession, undefined, {
+			pipelineId: submission.pipelineId,
+			relayMessageId: "missing-relay",
+			transport: DIRECT_RELAY_TRANSPORT,
+		});
+		assert.equal(invalid.status, "BLOCKED");
+		assert.match(invalid.error ?? "", /no durable relay message/);
+		const snapshot = await readEventLog(submission.communicationFile);
+		const task = snapshot.events.find(({ event }) => event.type === "task")?.event;
+		assert.ok(task?.messageId);
+		const valid = await created.coordinator.tickCurrent(root, "w-test", binding.paneId, binding.agentSession, undefined, {
+			pipelineId: submission.pipelineId,
+			relayMessageId: task.messageId,
+			transport: DIRECT_RELAY_TRANSPORT,
+		});
+		assert.equal(valid.status, "DONE", JSON.stringify(valid));
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

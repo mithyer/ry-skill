@@ -4,6 +4,9 @@ export type AgentKind = "codex" | "claude" | "pi";
 /** Transport lifecycle reported by Herdr for an agent pane. */
 export type AgentTransportStatus = "working" | "blocked" | "idle" | "done" | "unknown" | "closed";
 
+/** Versioned relay transport persisted in task, continuation, and control payloads. */
+export type RelayTransport = "pointer-v1" | "herdr-direct-v2";
+
 /** Semantic status returned by the delegation completion contract. */
 export type SemanticStatus = "DONE" | "BLOCKED" | "PARTIAL" | "ERROR";
 
@@ -376,7 +379,7 @@ export interface StartAgentInput {
 export interface PromptInput {
 	/** Herdr agent target/name or pane target. */
 	target: string;
-	/** Relay envelope text. */
+	/** Human-readable direct or legacy relay text. */
 	text: string;
 	/** Whether Herdr should wait for a settled state after submission. */
 	wait?: boolean;
@@ -464,8 +467,15 @@ export interface HerdrGateway {
 	waitFor(input: WaitInput): Promise<HerdrAgentSnapshot>;
 	/** Reads exact current agent metadata. */
 	getAgent(target: string, signal?: AbortSignal): Promise<HerdrAgentSnapshot>;
-	/** Captures recent agent output. */
-	readAgent(target: string, signal?: AbortSignal): Promise<HerdrAgentOutput>;
+	/**
+	 * Captures recent terminal output from an agent.
+	 *
+	 * @param target Agent target whose terminal should be read.
+	 * @param signal Optional cancellation signal.
+	 * @param lines Optional recent-line window; implementations use a safe default when omitted.
+	 * @returns Raw terminal output from the target.
+	 */
+	readAgent(target: string, signal?: AbortSignal, lines?: number): Promise<HerdrAgentOutput>;
 	/** Creates a tab without changing focus by default. */
 	createTab(input: CreateTabInput): Promise<{ tabId: string; paneId?: string }>;
 	/** Moves or closes a pane after semantic completion. */

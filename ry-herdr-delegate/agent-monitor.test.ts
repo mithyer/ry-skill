@@ -24,6 +24,8 @@ class MonitorFakeGateway implements HerdrGateway {
 	waitCalls = 0;
 	/** Number of terminal reads issued by the monitor. */
 	readCalls = 0;
+	/** Last recent-line window requested by the monitor. */
+	lastReadLines?: number;
 	/** Optional closure failure returned from wait. */
 	closedError?: Error & { code?: number };
 	/** Optional transient wait failure used to exercise getAgent fallback. */
@@ -72,7 +74,8 @@ class MonitorFakeGateway implements HerdrGateway {
 	/** Returns exact identity metadata for fallback callers. */
 	async getAgent(_target: string): Promise<HerdrAgentSnapshot> { this.getCalls += 1; return this.child; }
 	/** Returns one terminal snapshot without exposing any test output to diagnostics. */
-	async readAgent(_target: string): Promise<HerdrAgentOutput> {
+	async readAgent(_target: string, _signal?: AbortSignal, lines?: number): Promise<HerdrAgentOutput> {
+		this.lastReadLines = lines;
 		const index = Math.min(this.readCalls, Math.max(0, this.outputs.length - 1));
 		this.readCalls += 1;
 		return { text: this.outputs[index] ?? "" };
@@ -219,6 +222,31 @@ test("AgentTurnMonitor accepts terminal-wrapped current relay markers", async ()
 test("AgentTurnMonitor requires the current relay anchor for continuations", async () => {
 	const gateway = new MonitorFakeGateway(["STATUS: DONE\nSUMMARY: stale continuation\nVALIDATION: stale"]);
 	const result = await new AgentTurnMonitor({ gateway, maxAttempts: 1, sleep: async () => undefined }).observe(monitorInput({ requireRelayAnchor: true }));
+
+	assert.equal(result.status, "PARTIAL");
+	assert.equal(result.completion, undefined);
+});
+
+/** Verifies direct-v2 continuation parsing uses the transport/message anchor without a file marker. */
+test("AgentTurnMonitor accepts a direct-v2 continuation anchor", async () => {
+	const input = monitorInput({ requireRelayAnchor: true, relayTransport: "herdr-direct-v2", relayPromptLines: 400 });
+	const gateway = new MonitorFakeGateway([
+		`RELAY TRANSPORT: herdr-direct-v2\nMESSAGE ID: ${input.relayMessageId}\nSTATUS: DONE\nSUMMARY: direct continuation\nVALIDATION: direct anchor`,
+	]);
+	const result = await new AgentTurnMonitor({ gateway, maxAttempts: 1, sleep: async () => undefined }).observe(input);
+
+	assert.equal(result.status, "DONE");
+	assert.equal(result.completion?.summary, "direct continuation");
+	assert.equal(gateway.lastReadLines, 528);
+});
+
+/** Verifies a direct-v2 foreign message cannot satisfy an exact continuation anchor. */
+test("AgentTurnMonitor rejects a foreign direct-v2 continuation anchor", async () => {
+	const input = monitorInput({ requireRelayAnchor: true, relayTransport: "herdr-direct-v2" });
+	const gateway = new MonitorFakeGateway([
+		"RELAY TRANSPORT: herdr-direct-v2\nMESSAGE ID: msg-foreign\nSTATUS: DONE\nSUMMARY: foreign\nVALIDATION: foreign",
+	]);
+	const result = await new AgentTurnMonitor({ gateway, maxAttempts: 1, sleep: async () => undefined }).observe(input);
 
 	assert.equal(result.status, "PARTIAL");
 	assert.equal(result.completion, undefined);

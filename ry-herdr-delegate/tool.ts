@@ -62,6 +62,8 @@ export const DelegateToolParameters = Type.Object({
 	resourceKeys: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
 	stages: Type.Optional(Type.Array(pipelineStage, { maxItems: 12 })),
 	pipelineId: Type.Optional(Type.String({ minLength: 1 })),
+	// Direct coordinator prompts pass this identity so durable event validation precedes a tick.
+	relayMessageId: Type.Optional(Type.String({ minLength: 1 })),
 	targetStageId: Type.Optional(Type.String({ minLength: 1 })),
 	stageOccurrence: Type.Optional(Type.Integer({ minimum: 1 })),
 	expectedAttempt: Type.Optional(Type.Integer({ minimum: 1 })),
@@ -1057,7 +1059,11 @@ async function executeDelegateToolWithConfig(
 		const session = currentPiSession(ctx);
 		if (!workspaceId || !paneId || !session) return toolResult({ status: "BLOCKED", error: "pipeline.coordinator requires an exact Herdr pane and Pi session" }, true);
 		try {
-			const control = await createPipelineCoordinator(ctx, config, workspaceId).tickCurrent(ctx.cwd, workspaceId, paneId, { ...session, source: "herdr:pi" }, signal);
+			const control = await createPipelineCoordinator(ctx, config, workspaceId).tickCurrent(ctx.cwd, workspaceId, paneId, { ...session, source: "herdr:pi" }, signal, {
+				pipelineId: params.pipelineId,
+				relayMessageId: params.relayMessageId,
+				transport: "herdr-direct-v2",
+			});
 			return toolResult({ status: control.status, control, communicationFile: control.communicationFile }, control.status === "ERROR");
 		} catch (error) {
 			return toolResult({ status: "BLOCKED", error: error instanceof Error ? error.message : String(error) }, true);
