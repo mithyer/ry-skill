@@ -51,6 +51,18 @@ test("configuration resolves role and invocation model overrides", () => {
 	assert.deepEqual(invocationProfile.modelArgs, ["--model", "invocation-model"]);
 });
 
+/** Ensures the Pi-side configured-model placeholder cannot reach an external agent argv. */
+test("configuration resolves the configured model placeholder from the selected profile", () => {
+	const config = parseDelegateConfig({
+		version: 2,
+		agents: { codex: { model: "gpt-5.6-luna" } },
+		roles: { scout: { agent: "codex" } },
+	});
+	const profile = resolveAgentProfile(config, "scout", { agent: "codex", model: "__configured__", effort: "low" });
+	assert.equal(profile.model, "gpt-5.6-luna");
+	assert.deepEqual(buildFinalAgentArgs(profile), ["--model", "gpt-5.6-luna", "-c", 'model_reasoning_effort="low"', "--yolo"]);
+});
+
 /** Checks unknown fields and unsupported roles fail before a gateway call. */
 test("configuration rejects typos and unsupported roles", () => {
 	assert.throws(() => parseDelegateConfig({ version: 1, defaults: { panePolciy: "keep" } }), /unknown field/);

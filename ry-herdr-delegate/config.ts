@@ -20,6 +20,9 @@ function readDebugLevel(value: unknown, path: string, fallback: DebugLevel): Deb
 	return value as DebugLevel;
 }
 
+/** Placeholder emitted by some Pi tool callers to request the configured profile model. */
+const CONFIGURED_MODEL_SENTINEL = "__configured__";
+
 /** Built-in autonomy arguments for the supported autonomous CLI profiles. */
 const BUILT_IN_PROFILE_DEFAULTS: Record<AgentKind, AgentProfileConfig> = {
 	codex: {
@@ -345,7 +348,9 @@ export function resolveAgentProfile(
 	const roleConfig = resolveRole(config, role);
 	const kind = overrides.agent ?? roleConfig.agent;
 	const profile = config.agents[kind] ?? BUILT_IN_PROFILE_DEFAULTS[kind];
-	const model = overrides.model ?? roleConfig.model ?? profile.model ?? undefined;
+	// Resolve the caller placeholder to the selected profile instead of leaking it into child argv.
+	const modelOverride = overrides.model === CONFIGURED_MODEL_SENTINEL ? undefined : overrides.model;
+	const model = modelOverride ?? roleConfig.model ?? profile.model ?? undefined;
 	const effort = overrides.effort ?? roleConfig.effort ?? profile.effort ?? undefined;
 	const profileEnv = mergeEnv(config.defaults.env, profile.env, roleConfig.env);
 	if (Object.keys(profileEnv).length > 0 && !capabilities.childEnvVerified) {
